@@ -1,3 +1,5 @@
+"""Ballard rosette (street-of-coverage) constellation layer generator.
+"""
 from __future__ import annotations
 
 import math
@@ -15,6 +17,8 @@ def _shell_half_angle_bounds_rad_from_cov(
     cov: CoverageConfig,
     constellation_alt_km: float,
 ) -> tuple[float, float, float]:
+    """Earth-central half-angles limited by interceptor range and by minimum
+    elevation; returns (psi_range, psi_elev, psi_bound) in radians."""
     r_p = float(earth.r_eq_km + cov.intercept_alt_km)
     r_s = float(earth.r_eq_km + constellation_alt_km)
     range_km = float(cov.max_range_km)
@@ -38,6 +42,7 @@ def _shell_half_angle_bounds_rad_from_cov(
 
 
 def _latitude_grid_deg(lat_min_deg: float, lat_max_deg: float, n_samples: int) -> np.ndarray:
+    """Evenly spaced latitude samples between the given bounds (deg)."""
     lo = float(min(lat_min_deg, lat_max_deg))
     hi = float(max(lat_min_deg, lat_max_deg))
     n = int(max(3, n_samples))

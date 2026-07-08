@@ -1,9 +1,13 @@
+"""Combined region-of-interest mask construction from lat/lon boxes and
+country names, with support for full and symmetric (latitude-only) shells.
+"""
 import numpy as np
 
 from sbi_coverage.core.regions import country_latlon_bounds, mask_country
 
 
 def _as_finite_float(value: object) -> float | None:
+    """Return the value as float when it is a finite number, else None."""
     if isinstance(value, (int, float, np.number)):
         out = float(value)
         if np.isfinite(out):

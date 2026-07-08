@@ -1,3 +1,10 @@
+"""Core coverage test: which shell points can each satellite reach.
+
+A satellite covers a point when it is (1) within the interceptor's maximum
+range and (2) above the point's local horizon by at least the minimum
+elevation angle. Numba-compiled kernels are used when available, with a
+NumPy fallback otherwise.
+"""
 import numpy as np
 
 try:
@@ -41,6 +48,7 @@ if NUMBA_AVAILABLE:
         max_range2: float,
         min_sin_elev: float,
     ) -> np.ndarray:
+        """Numba kernel: per-point covering-satellite counts (range + elevation test)."""
         Ns = r_sat_ecef_km.shape[0]
         Np = r_pts_ecef_km.shape[0]
         counts = np.zeros(Np, dtype=np.int32)
@@ -88,6 +96,21 @@ def coverage_counts_ecef(
     max_range_km: float,
     min_elev_deg: float,
 ) -> np.ndarray:
+    """
+    Count covering satellites per shell point at one timestep.
+
+    Parameters
+    ----------
+    r_sat_ecef_km : (Ns, 3) satellite positions, ECEF km
+    r_pts_ecef_km : (Np, 3) shell point positions, ECEF km
+    n_hat_ecef    : (Np, 3) outward unit normals at each shell point
+    max_range_km  : interceptor maximum reach, km
+    min_elev_deg  : minimum satellite elevation above the point's horizon, deg
+
+    Returns
+    -------
+    (Np,) int32 array: number of satellites covering each point.
+    """
     _validate_coverage_inputs(r_sat_ecef_km, r_pts_ecef_km, n_hat_ecef, max_range_km, min_elev_deg)
     max_range2 = float(max_range_km * max_range_km)
     min_sin_elev = float(np.sin(np.deg2rad(min_elev_deg)))

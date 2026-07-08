@@ -1,3 +1,5 @@
+"""Constellation layer generators (Walker, RGT, LFC, Ballard, and misc).
+"""
 from .misc import uniform_layer, random_layer, wright_hex
 from .auto_walker import auto_walker_delta, auto_walker_star
 from .walker import walker_delta_layer, walker_star_layer

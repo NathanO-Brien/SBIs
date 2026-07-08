@@ -15,8 +15,12 @@ from . import regions
 class Shell:
     """A spherical shell sampling grid in ECEF.
 
-    The intent is to treat the simulation point set (points + normals + lat/lon/meta)
-    as a first-class object rather than passing raw arrays through the API.
+    Bundles the simulation point set (points + normals + lat/lon + metadata)
+    into a single object rather than passing raw arrays through the API.
+    Three construction modes exist:
+      - "full":       quasi-uniform Fibonacci sampling of the whole sphere
+      - "symmetric":  latitude-only line of points at a fixed longitude
+      - from_points(): caller-supplied list of exact lat/lon targets
 
     Typical usage:
         shell = Shell(earth, n_points=5000, shell_alt_km=0.0, analysis_shell_mode="full")
@@ -106,6 +110,7 @@ class Shell:
         longitude_deg: float = 0.0,
         shell_alt_km: float = 0.0,
     ) -> "Shell":
+        """Convenience constructor for a symmetric (latitude-only) shell."""
         return cls(
             earth=earth,
             shell_alt_km=float(shell_alt_km),
@@ -177,20 +182,24 @@ class Shell:
         new._validate()
         return new
 
-    # Convenience aliases to match the language in your scripts
+    # Convenience aliases used by driver scripts
     @property
     def points_ecef(self) -> np.ndarray:
+        """Alias for points_ecef_km."""
         return self.points_ecef_km
 
     @property
     def n_hat_ecef(self) -> np.ndarray:
+        """Alias for normals_ecef."""
         return self.normals_ecef
 
     @property
     def n_points_used(self) -> int:
+        """Actual number of points in this shell (after any masking)."""
         return int(self.points_ecef_km.shape[0])
 
     def _validate(self) -> None:
+        """Check array shapes are internally consistent."""
         pts = self.points_ecef_km
         n_hat = self.normals_ecef
         if pts.ndim != 2 or pts.shape[1] != 3:
@@ -235,6 +244,11 @@ class Shell:
         lon_min_deg: float,
         lon_max_deg: float,
     ) -> "Shell":
+        """Return a new Shell restricted to a lat/lon bounding box.
+
+        Symmetric shells have no longitude dimension, so the box collapses to
+        a latitude band in that mode.
+        """
         if str(self.analysis_shell_mode).strip().lower() == "symmetric":
             mask = regions.mask_lat_band(
                 self.lat_deg,
@@ -271,6 +285,12 @@ class Shell:
         *countries: str,
         bbox_prefilter: bool = True,
     ) -> "Shell":
+        """Return a new Shell restricted to points inside one or more countries.
+
+        Accepts a single name, a sequence of names, or multiple positional
+        names. Symmetric shells collapse the country geometry to its latitude
+        band. bbox_prefilter speeds up point-in-polygon testing on full shells.
+        """
         if countries:
             if isinstance(country, str):
                 country_arg: str | Sequence[str] = [country, *countries]

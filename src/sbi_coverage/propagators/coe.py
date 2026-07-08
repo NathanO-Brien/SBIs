@@ -1,15 +1,13 @@
 """
 Shared orbital elements -> ECI r,v conversion helpers (km / km/s).
 
-IMPORTANT:
-- Your repo uses "vectorized OrbitalElements": elems.a_km, elems.e, ... are arrays (Nsats,).
-- This file supports BOTH:
-  (a) scalar OrbitalElements (single satellite)
-  (b) vectorized OrbitalElements (arrays for many satellites)
+Supports both scalar OrbitalElements (single satellite) and vectorized
+OrbitalElements (each field an array of length n_sats).
 
 Anomaly handling:
-- If elems.ta_rad is not None, use it (true anomaly, scalar or array)
-- Else derive nu from mean anomaly elems.M0_rad using Kepler solve (vectorized Newton)
+- If elems.ta_rad is not None, it is used directly (true anomaly).
+- Otherwise true anomaly is derived from mean anomaly elems.M0_rad via a
+  vectorized Newton solve of Kepler's equation.
 """
 
 from __future__ import annotations
@@ -21,6 +19,7 @@ from sbi_coverage.core.config import EarthConstants
 
 
 def _wrap_to_pi(x: np.ndarray) -> np.ndarray:
+    """Wrap angles to the interval [-pi, pi)."""
     return (x + np.pi) % (2.0 * np.pi) - np.pi
 
 

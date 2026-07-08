@@ -1,3 +1,6 @@
+"""3D orbit plots and coverage-over-time video rendering for Analysis
+results.
+"""
 from __future__ import annotations
 
 import os
@@ -386,6 +389,7 @@ def render_coverage_video_mercator(
 
 
 def _draw_frame_axes(ax: Any, *, frame_name: str, scale_km: float) -> list[Line2D]:
+    """Draw X/Y/Z axis lines at the origin; return legend handles."""
     L = float(max(scale_km, 1.0))
     # Keep axis colors distinct from layer palette (tab20).
     c_x = "#ff00ff"
@@ -403,6 +407,7 @@ def _draw_frame_axes(ax: Any, *, frame_name: str, scale_km: float) -> list[Line2
 
 
 def _plot_earth(ax: Any, *, re_km: float) -> None:
+    """Draw a translucent spherical Earth surface on a 3D axis."""
     lon = np.linspace(-np.pi, np.pi, 96)
     lat = np.linspace(-0.5 * np.pi, 0.5 * np.pi, 64)
     lon_g, lat_g = np.meshgrid(lon, lat)
@@ -427,6 +432,11 @@ def _plot_earth(ax: Any, *, re_km: float) -> None:
 
 
 def _build_layer_id(*, layer_specs: list[dict[str, Any]] | None, ns: int) -> np.ndarray:
+    """Assign a layer index to each satellite based on per-layer counts.
+
+    Falls back to a single layer (all zeros) when specs are missing or the
+    counts do not sum to the satellite total.
+    """
     if not layer_specs:
         return np.zeros(ns, dtype=np.int64)
 
@@ -451,6 +461,7 @@ def _build_layer_id(*, layer_specs: list[dict[str, Any]] | None, ns: int) -> np.
 
 
 def _extract_layer_count(spec: dict[str, Any]) -> int | None:
+    """Best-effort satellite count from a layer spec's known key names."""
     for key in ("n_total", "n_sats_total", "T", "n_satellites"):
         v = spec.get(key)
         if isinstance(v, (int, np.integer)):
@@ -472,6 +483,7 @@ def _extract_layer_count(spec: dict[str, Any]) -> int | None:
 
 
 def _build_layer_labels(*, layer_specs: list[dict[str, Any]] | None) -> dict[int, str]:
+    """Build display labels per layer, de-duplicating repeated names."""
     if not layer_specs:
         return {}
     out: dict[int, str] = {}
@@ -494,6 +506,7 @@ def _build_layer_labels(*, layer_specs: list[dict[str, Any]] | None) -> dict[int
 
 
 def _layer_color_map(layer_id: np.ndarray) -> dict[int, tuple[float, float, float, float]]:
+    """Map each layer index to a distinct high-contrast color."""
     unique = sorted(set(int(x) for x in layer_id.tolist()))
     # Curated dark/high-contrast palette for visibility on light gray Earth + white background.
     palette = [
@@ -512,6 +525,7 @@ def _layer_color_map(layer_id: np.ndarray) -> dict[int, tuple[float, float, floa
 
 
 def _get_attr_any(obj: Any, names: list[str], default: Any = None) -> Any:
+    """Return the first non-None attribute found among candidate names."""
     for n in names:
         if hasattr(obj, n):
             v = getattr(obj, n)
@@ -521,6 +535,8 @@ def _get_attr_any(obj: Any, names: list[str], default: Any = None) -> Any:
 
 
 def _extract_elements(elems0: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Extract (a, e, i, raan, argp, M) arrays from an OrbitalElements-like
+    object, a dict, or a raw (N, 6) array; angles coerced to radians."""
     if hasattr(elems0, "a_km") and hasattr(elems0, "e"):
         a_km = np.asarray(getattr(elems0, "a_km"), dtype=np.float64)
         e = np.asarray(getattr(elems0, "e"), dtype=np.float64)
@@ -551,6 +567,7 @@ def _extract_elements(elems0: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray, 
 
 
 def _ensure_radians(*angles: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Convert angle arrays to radians when their magnitude suggests degrees."""
     out: list[np.ndarray] = []
     for a in angles:
         x = np.asarray(a, dtype=np.float64)
@@ -561,6 +578,7 @@ def _ensure_radians(*angles: np.ndarray) -> tuple[np.ndarray, ...]:
 
 
 def _eci_to_ecef_simple(r_eci_km: np.ndarray, *, t_s: float, omega_earth_rad_s: float) -> np.ndarray:
+    """Rotate ECI positions into ECEF using theta = omega_earth * t."""
     th = float(omega_earth_rad_s) * float(t_s)
     c = np.cos(th)
     s = np.sin(th)
@@ -578,6 +596,7 @@ def _orbit_r_eci_from_elements(
     argp: float,
     nu: np.ndarray,
 ) -> np.ndarray:
+    """Sample ECI positions along an orbit at the given true anomalies."""
     nu = np.asarray(nu, dtype=np.float64)
     p = float(a_km) * (1.0 - float(e) * float(e))
     r = p / np.maximum(1.0 + float(e) * np.cos(nu), 1e-12)
@@ -603,6 +622,7 @@ def _orbit_r_eci_from_elements(
 
 
 def _true_anomaly_from_mean_anomaly(M: float, e: float) -> float:
+    """Solve Kepler's equation by Newton iteration; return true anomaly (rad)."""
     M = float((M + np.pi) % (2.0 * np.pi) - np.pi)
     e = float(e)
     E = M if e < 0.8 else (np.pi if M >= 0.0 else -np.pi)
@@ -620,6 +640,7 @@ def _true_anomaly_from_mean_anomaly(M: float, e: float) -> float:
 
 
 def _set_equal_3d(ax: Any, *, re_km: float, points: np.ndarray, r_max_km: float | None = None) -> None:
+    """Set equal-aspect 3D axis limits sized to fit Earth and all points."""
     pts = np.asarray(points, dtype=np.float64)
     if pts.size == 0:
         lim = 1.5 * re_km
@@ -642,6 +663,7 @@ def _set_equal_3d(ax: Any, *, re_km: float, points: np.ndarray, r_max_km: float 
 
 
 def _mercator_project(*, lat_deg: np.ndarray, lon_deg: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Project lat/lon (deg) to Mercator x/y; latitude clipped to +/-85 deg."""
     lon = ((np.asarray(lon_deg, dtype=np.float64) + 180.0) % 360.0) - 180.0
     lat = np.clip(np.asarray(lat_deg, dtype=np.float64), -85.0, 85.0)
     x = np.deg2rad(lon)
@@ -651,12 +673,14 @@ def _mercator_project(*, lat_deg: np.ndarray, lon_deg: np.ndarray) -> tuple[np.n
 
 
 def _mollweide_project(*, lat_deg: np.ndarray, lon_deg: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Convert lat/lon (deg) to radians for matplotlib's mollweide axes."""
     lon = ((np.asarray(lon_deg, dtype=np.float64) + 180.0) % 360.0) - 180.0
     lat = np.clip(np.asarray(lat_deg, dtype=np.float64), -89.999, 89.999)
     return np.deg2rad(lon), np.deg2rad(lat)
 
 
 def _format_hhmmss(t_s: float) -> str:
+    """Format seconds as HH:MM:SS."""
     total = max(0, int(round(float(t_s))))
     hh = total // 3600
     mm = (total % 3600) // 60
@@ -665,6 +689,7 @@ def _format_hhmmss(t_s: float) -> str:
 
 
 def _draw_mollweide_graticule(ax: Any) -> None:
+    """Draw graticule ticks/labels on a mollweide axis."""
     xtick_deg = np.arange(-150, 151, 30)
     xtick_rad = np.deg2rad(xtick_deg)
     ax.set_xticks(xtick_rad)
@@ -680,6 +705,7 @@ def _draw_mollweide_graticule(ax: Any) -> None:
 
 
 def _draw_mollweide_longitude_labels(ax: Any) -> None:
+    """Place longitude labels below a mollweide axis in axes coordinates."""
     xtick_deg = np.arange(-150, 151, 30)
     for deg in xtick_deg:
         x = 0.5 + 0.5 * (float(deg) / 180.0)
@@ -698,6 +724,7 @@ def _draw_mollweide_longitude_labels(ax: Any) -> None:
 
 
 def _shell_roi_mode(meta: Any) -> str | None:
+    """Read the shell's roi_mode string from run metadata, if present."""
     if not isinstance(meta, dict):
         return None
     inputs = meta.get("inputs")
@@ -713,6 +740,7 @@ def _shell_roi_mode(meta: Any) -> str | None:
 
 
 def _extract_world_boundaries() -> list[Any]:
+    """Load all country boundary geometries; empty list when unavailable."""
     if _regions is None:
         return []
     try:
@@ -728,6 +756,7 @@ def _extract_world_boundaries() -> list[Any]:
 
 
 def _extract_roi_country_boundaries(meta: Any) -> list[Any]:
+    """Look up boundary geometries for ROI countries named in run metadata."""
     if _regions is None or not isinstance(meta, dict):
         return []
     countries: list[str] = []
@@ -758,6 +787,7 @@ def _extract_roi_country_boundaries(meta: Any) -> list[Any]:
 
 
 def _extract_country_boundaries(countries: list[str]) -> list[Any]:
+    """Look up boundary geometries for the named countries (deduplicated)."""
     if _regions is None:
         return []
     out = []
@@ -776,6 +806,7 @@ def _extract_country_boundaries(countries: list[str]) -> list[Any]:
 
 
 def _plot_roi_boundaries(ax: Any, border_geoms: list[Any]) -> None:
+    """Draw highlighted ROI country borders on a mollweide axis."""
     for country, geom in border_geoms:
         for line_lon, line_lat in _iter_geometry_lonlat_lines(geom):
             for seg_lon, seg_lat in _split_dateline_segments(line_lon, line_lat):
@@ -784,6 +815,7 @@ def _plot_roi_boundaries(ax: Any, border_geoms: list[Any]) -> None:
 
 
 def _iter_geometry_lonlat_lines(geom: Any) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Extract exterior boundary (lon, lat) line arrays from a polygon geometry."""
     out: list[tuple[np.ndarray, np.ndarray]] = []
     if geom is None:
         return out
@@ -799,6 +831,7 @@ def _iter_geometry_lonlat_lines(geom: Any) -> list[tuple[np.ndarray, np.ndarray]
 
 
 def _plot_world_boundaries(ax: Any, world_geoms: list[Any]) -> None:
+    """Draw thin world country borders on a mollweide axis."""
     for geom in world_geoms:
         for line_lon, line_lat in _iter_geometry_lonlat_lines(geom):
             for seg_lon, seg_lat in _split_dateline_segments(line_lon, line_lat):
@@ -807,6 +840,7 @@ def _plot_world_boundaries(ax: Any, world_geoms: list[Any]) -> None:
 
 
 def _split_dateline_segments(lon: np.ndarray, lat: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Split a boundary line where it crosses the dateline to avoid wrap artifacts."""
     lon_arr = ((np.asarray(lon, dtype=np.float64) + 180.0) % 360.0) - 180.0
     lat_arr = np.asarray(lat, dtype=np.float64)
     if lon_arr.size <= 1:
@@ -835,6 +869,7 @@ def _prepare_country_stats(
     lon_deg: np.ndarray,
     countries: list[str],
 ) -> list[dict[str, Any]]:
+    """Build per-country point masks for the coverage stats overlay."""
     if _regions is None:
         return []
 

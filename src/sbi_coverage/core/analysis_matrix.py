@@ -1,3 +1,6 @@
+"""In-memory analysis product (time-by-point coverage counts) and its
+provenance metadata.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -17,12 +20,11 @@ def shell_id_from_latlon(
 ) -> str:
     """Compute a stable ID for a shell point ordering.
 
-    We hash lat/lon (float64 bytes) + shell_alt_km + optional extra fields.
-    This ID is used to ensure compatibility across stored analysis matrices.
+    Hashes lat/lon (float64 bytes) + shell_alt_km + optional extra fields.
+    The ID is used to verify compatibility across stored analysis matrices.
 
-    Notes:
-    - This assumes that lat/lon ordering uniquely identifies the point ordering used
-      in the counts matrix (which is true in your Shell object).
+    Assumes lat/lon ordering uniquely identifies the point ordering used in
+    the counts matrix (true for shells built by the Shell class).
     """
     lat = np.asarray(lat_deg, dtype=np.float64)
     lon = np.asarray(lon_deg, dtype=np.float64)
@@ -84,10 +86,10 @@ def build_meta_bundle(
     dtype: str,
     counts_shape: tuple[int, int],
 ) -> Dict[str, Any]:
-    """Build a provenance-rich metadata dict.
+    """Build a provenance-rich metadata dict for a simulation run.
 
-    This assumes sim/cov are dataclasses (asdict-able). If they are not, we fall back
-    to repr().
+    sim/cov/earth are expected to be dataclasses (asdict-able); non-dataclass
+    objects fall back to repr().
     """
     def safe_asdict(obj: Any) -> Any:
         try:

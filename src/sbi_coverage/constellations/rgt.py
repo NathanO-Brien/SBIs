@@ -1,3 +1,4 @@
+"""Repeating-ground-track (RGT) constellation layer generator."""
 from __future__ import annotations
 
 import numpy as np
@@ -8,6 +9,7 @@ from .layer import Layer
 
 
 def _validate_tp(*, n_sats_total: int, n_planes: int) -> tuple[int, int, int]:
+    """Validate T/P divisibility and return (T, P, sats_per_plane)."""
     T = int(n_sats_total)
     P = int(n_planes)
     if T <= 0:
@@ -30,6 +32,8 @@ def _rgt_period_s(
     repeat_orbits: int,
     repeat_days: int,
 ) -> float:
+    """Orbit period satisfying the repeat condition: repeat_orbits revolutions
+    in repeat_days sidereal days."""
     if int(repeat_orbits) <= 0:
         raise ValueError("RGT layer: repeat_orbits must be > 0")
     if int(repeat_days) <= 0:
@@ -39,6 +43,7 @@ def _rgt_period_s(
 
 
 def _semi_major_axis_from_period_km(*, earth: EarthConstants, period_s: float) -> float:
+    """Invert Kepler's third law: a = (mu * (T / 2pi)^2)^(1/3)."""
     if period_s <= 0.0:
         raise ValueError("RGT layer: derived period must be > 0")
     return float((earth.mu_km3_s2 * (period_s / (2.0 * np.pi)) ** 2) ** (1.0 / 3.0))
@@ -69,10 +74,9 @@ def rgt_layer(
       - f applies a Walker-like plane phasing shift for a first practical slotting scheme
 
     Notes:
-      - This is a first-pass RGT layer generator for your existing architecture.
-      - The repeat condition derives the orbit period, semimajor axis, and altitude.
-      - We then distribute satellites across planes and along-track slots similarly to
-        Walker-style layer generation so it plugs into your existing workflow cleanly.
+      - The repeat condition derives the orbit period, semi-major axis, and altitude.
+      - Satellites are distributed across planes and along-track slots following
+        Walker-style layer generation conventions.
     """
     T, P, S = _validate_tp(n_sats_total=n_sats_total, n_planes=n_planes)
 

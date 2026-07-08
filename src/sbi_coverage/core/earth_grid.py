@@ -1,10 +1,16 @@
+"""Target shell point generation on a spherical Earth.
+
+Provides quasi-uniform Fibonacci sphere sampling and a latitude-line variant
+used for symmetric (latitude-only) analysis shells.
+"""
 import numpy as np
 from .config import EarthConstants
 
 
 def fibonacci_sphere_points(n: int) -> np.ndarray:
     """
-    Returns Nx3 unit vectors approximately evenly distributed on a sphere.
+    Return (N, 3) unit vectors approximately evenly distributed on a sphere
+    using the golden-ratio (Fibonacci) spiral method.
     """
     i = np.arange(n, dtype=np.float64)
     phi = (1 + 5**0.5) / 2  # golden ratio

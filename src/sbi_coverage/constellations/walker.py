@@ -1,4 +1,4 @@
-# sbi_coverage/constellations/walker.py
+"""Walker delta and Walker star constellation layer generators."""
 from __future__ import annotations
 
 import numpy as np
@@ -56,7 +56,7 @@ def walker_delta_layer(
             M(p,s) = 360/S * s + (F * p) * (360/T) + m0_offset
 
     Returns:
-      Layer(elems=..., phys=..., spec=...) using your existing Layer dataclass.
+      Layer(elems=..., phys=..., spec=...) compatible with combine_layers().
     """
     T, P, S = _validate_tp(n_sats_total=n_sats_total, n_planes=n_planes)
     inc_deg = float(inc_deg)

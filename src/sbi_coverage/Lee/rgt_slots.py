@@ -1,3 +1,6 @@
+"""RGT orbital slot construction: common-ground-track layers, J2-adjusted
+semi-major axis, and seed satellite layers.
+"""
 from __future__ import annotations
 
 from math import gcd
@@ -10,6 +13,7 @@ from ..constellations.layer import Layer
 
 
 def _a_km_from_np_nd(N_P: int, N_D: int, earth: EarthConstants) -> float:
+    """Keplerian semi-major axis for N_P orbits in N_D sidereal days."""
     T_sid = (2.0 * np.pi) / earth.omega_earth_rad_s
     T_S   = N_D * T_sid / N_P
     return float((earth.mu_km3_s2 * (T_S / (2.0 * np.pi))**2) ** (1.0 / 3.0))
@@ -19,7 +23,7 @@ def a_km_j2_rgt(N_P: int, N_D: int, inc_deg: float, earth: EarthConstants) -> fl
     """J2-corrected semi-major axis for an RGT orbit (Newton-Raphson).
 
     Finds a (km) satisfying the exact J2 repeating-ground-track condition for
-    our frames.py ECEF convention (ECEF_lon = RAAN + ω_E·t):
+    the frames.py ECEF convention (ECEF_lon = RAAN + ω_E·t):
 
         N_P · (ω_E + Ω̇(a)) = N_D · (n_kep(a) + ω̇(a))
 
@@ -225,6 +229,7 @@ def seed_layer(layer: Layer) -> Layer:
     s = layer.phys
 
     def _first(arr: np.ndarray) -> np.ndarray:
+        """Return the first element as a length-1 float64 array."""
         return np.asarray(arr, dtype=np.float64)[[0]]
 
     seed_elems = OrbitalElements(

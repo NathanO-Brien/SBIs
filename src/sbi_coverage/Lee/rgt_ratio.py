@@ -1,3 +1,5 @@
+"""Candidate repeating-ground-track ratio (N_P/N_D) enumeration.
+"""
 from __future__ import annotations
 
 from math import gcd
@@ -8,6 +10,7 @@ from ..core.config import EarthConstants
 
 
 def _orbital_period_s(a_km: float, earth: EarthConstants) -> float:
+    """Keplerian orbital period T = 2*pi*sqrt(a^3/mu), seconds."""
     return 2.0 * np.pi * np.sqrt(a_km**3 / earth.mu_km3_s2)
 
 

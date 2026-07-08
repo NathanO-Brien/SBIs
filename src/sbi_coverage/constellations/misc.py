@@ -1,3 +1,6 @@
+"""Miscellaneous constellation layer generators: uniform, random, and
+Wright hexagonal-packing layers.
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -90,11 +93,11 @@ def random_layer(
 
     IMPORTANT:
       - `a_km` is SEMI-MAJOR AXIS in km (not altitude).
-      - If you want a circular shell of altitude h_km, pass a_km = earth.r_eq_km + h_km.
+      - For a circular shell at altitude h_km, pass a_km = earth.r_eq_km + h_km.
 
     Notes:
-      - If you later care about perigee constraints (e.g., >= 200 km), you should
-        generate e with a constraint on rp = a(1-e).
+      - Perigee altitude is not constrained; enforcing a minimum perigee
+        (e.g. >= 200 km) would require generating e subject to rp = a(1-e).
       - `inc_deg` is used directly as the orbit inclination in degrees.
     """
     n_sats = int(n_sats)
@@ -203,9 +206,9 @@ def wright_hex(
     * lmin/lmax are treated as geodetic latitude magnitudes in degrees, symmetric about
       the equator.
     * Counts are ceiled to avoid under-coverage.
-    * Phasing is NOT classic "cumulative Walker f" phasing. Instead we apply the
-      *alternating* even/odd-plane stagger required for hex packing at |L| = lmin, with
-      a latitude-corrected along-track shift:
+    * Phasing is NOT classic "cumulative Walker f" phasing. Instead an
+      *alternating* even/odd-plane stagger is applied, as required for hex
+      packing at |L| = lmin, with a latitude-corrected along-track shift:
           Δu = (360/S) * (1 / (2 cos i_Lmin))
       where cos(i_L) = cos(i)/cos(L) (Wright Eq. 10).
     """
@@ -278,7 +281,7 @@ def wright_hex(
 
     T = P * S
 
-    # ---- Build elements arrays (same style as your old walker_delta) ----
+    # ---- Build elements arrays (same layout as walker_delta_layer) ----
     a_km = float(earth.r_eq_km + h_km)
 
     a_arr = np.full(T, a_km, dtype=np.float64)

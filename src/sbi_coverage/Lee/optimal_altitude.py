@@ -1,3 +1,5 @@
+"""Geometric optimal satellite altitude for boost-phase intercept coverage.
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -52,6 +54,8 @@ def optimal_sat_altitude_km(
     min_elev_rad = np.deg2rad(min_elev_deg)
 
     def imbalance(h_sat: float) -> float:
+        """Difference between elevation-limited and range-limited footprint
+        radii; the optimal altitude is its root."""
         r_sat = earth.r_eq_km + h_sat
         return _rho_elev(r_sat, r_tgt, min_elev_rad) - _rho_range(r_sat, r_tgt, max_range_km)
 

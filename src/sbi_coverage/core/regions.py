@@ -1,10 +1,13 @@
+"""Region-of-interest masking: latitude bands, lat/lon boxes, and country
+boundary polygons (Natural Earth via GeoPandas).
+"""
 from __future__ import annotations
 
 from collections.abc import Sequence
 
 import numpy as np
 
-# Optional heavy deps (only required if you call country masking)
+# Optional heavy dependencies — only required for country masking
 try:
     import geopandas as gpd
     from shapely.geometry import Point
@@ -67,8 +70,6 @@ def mask_latlon_box(
 # ----------------------------
 # Country masking via GeoPandas
 # ----------------------------
-
-_COUNTRY_CACHE = {}
 
 def _load_naturalearth_lowres():
     """
@@ -192,6 +193,7 @@ def country_latlon_bounds(country: str) -> dict[str, float | str]:
 
 
 def _normalize_country_inputs(country: str | Sequence[str]) -> list[str]:
+    """Coerce a country name or sequence of names into a clean list."""
     if isinstance(country, str):
         out = [country]
     else:
@@ -209,6 +211,7 @@ def _mask_single_country(
     *,
     bbox_prefilter: bool = True,
 ) -> tuple[np.ndarray, dict]:
+    """Point-in-polygon mask for a single country. Returns (mask, roi_meta)."""
     geom, meta = country_polygon(country)
 
     # Bounding box prefilter to reduce point-in-polygon checks

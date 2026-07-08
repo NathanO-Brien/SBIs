@@ -1,3 +1,6 @@
+"""Concatenate multiple constellation layers into single element/physical
+arrays for simulation.
+"""
 from __future__ import annotations
 
 import numpy as np

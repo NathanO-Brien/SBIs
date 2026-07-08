@@ -1,3 +1,10 @@
+"""Nominal analytical propagator: Keplerian two-body motion with optional
+J2 secular drift (RAAN and argument of perigee rates) and an optional
+averaged exponential-atmosphere drag model.
+
+Implements the propagator interface expected by simulate.run_simulation():
+init_state() and step_state_to_eci_positions().
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,6 +17,7 @@ from sbi_coverage.core.elements import OrbitalElements, SatellitePhysical
 
 
 def mean_motion_rad_s(a_km: np.ndarray, mu_km3_s2: float) -> np.ndarray:
+    """Two-body mean motion n = sqrt(mu / a^3), rad/s."""
     return np.sqrt(mu_km3_s2 / np.maximum(a_km, 1e-9) ** 3)
 
 
@@ -79,6 +87,7 @@ def j2_secular_rates_rad_s(a_km, e, i_rad, earth: EarthConstants) -> tuple[np.nd
 
 
 def density_exponential_kg_m3(h_km: np.ndarray, sim: SimConfig) -> np.ndarray:
+    """Exponential atmosphere density model: rho(h) = rho_scale * rho0 * exp(-(h-h0)/H)."""
     rho_scale = float(getattr(sim, "rho_scale", 1.0))
     rho0 = float(getattr(sim, "rho0_kg_m3", 3.614e-13))
     h0_km = float(getattr(sim, "h0_km", 700.0))
@@ -97,7 +106,10 @@ def drag_update_a_avg(
     dt_s: float,
 ) -> np.ndarray:
     """
-    Smooth averaged drag proxy (same as your original file).
+    Averaged drag decay of the semi-major axis over one timestep.
+
+    Uses the mean of the atmospheric density at perigee and apogee altitudes
+    and da/dt = -2 a^2 v a_drag / mu, floored at drag_floor_alt_km.
     """
     rp_km = a_km * (1.0 - e)
     ra_km = a_km * (1.0 + e)
@@ -206,6 +218,7 @@ def step_state_to_eci_positions(
 
 
 def get_metadata(*, state: PropState, sim: SimConfig, earth: EarthConstants, phys: SatellitePhysical) -> dict[str, Any]:
+    """Return propagator identification and settings for run metadata."""
     return {
         "name": "Nominal_Propagator",
         "epoch0": getattr(sim, "epoch0", "J2000"),

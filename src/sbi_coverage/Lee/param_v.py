@@ -1,3 +1,6 @@
+"""Assemble the SCLP constraint matrix (param_V) from seed access profiles
+using the circulant APC structure.
+"""
 from __future__ import annotations
 
 import numpy as np

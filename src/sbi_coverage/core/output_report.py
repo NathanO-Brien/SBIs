@@ -1,3 +1,6 @@
+"""Console reporting for Analysis objects: coverage summary, grids, and
+provenance metadata.
+"""
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
@@ -57,6 +60,7 @@ def _normalize_layers(meta_layers: Any) -> List[Dict[str, Any]]:
 
 
 def _sum_numeric(layers: List[Dict[str, Any]], key: str) -> Optional[int]:
+    """Sum an integer field across layer dicts; None if no layer has it."""
     vals: List[int] = []
     for layer in layers:
         v = layer.get(key)
@@ -91,6 +95,7 @@ def _print_layers_hierarchical(layers_raw: Any, indent: int = 2) -> None:
 
 
 def _get_summary_from_meta(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Extract the stored counts summary, supporting old and new schemas."""
     # New schema
     result = meta.get("result")
     if isinstance(result, dict):
@@ -171,7 +176,7 @@ def _print_analysis_summary(ao: Analysis) -> None:
             _print_kv("max count", summary["max"])
         if "mean" in summary:
             _print_kv("mean count", summary["mean"])
-        # Optional extras if you store them
+        # Optional extras when present in stored metadata
         if "nonzero_fraction" in summary:
             _print_kv("nonzero_fraction", summary["nonzero_fraction"])
     else:

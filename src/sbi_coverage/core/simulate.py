@@ -1,3 +1,10 @@
+"""Coverage simulation driver.
+
+Propagates a constellation over the simulation horizon, converts positions
+to ECEF at each timestep, evaluates the coverage test against the target
+shell, and returns an Analysis object (time-by-point counts plus provenance
+metadata).
+"""
 from __future__ import annotations
 
 import hashlib
@@ -197,6 +204,7 @@ def _build_run_metadata(
     propagator: str,
     prop_meta: Any,
 ) -> dict[str, Any]:
+    """Assemble the provenance metadata dict stored on the Analysis result."""
     shell_meta = dict(getattr(shell, "meta", {}))
     n_points_used = int(lat_deg.size)
     n_points_requested = int(shell_meta.get("n_requested", getattr(shell, "n_points", n_points_used)))
@@ -274,7 +282,7 @@ def _sim_metadata_for_propagator(*, sim: SimConfig, propagator: str) -> dict[str
         "analysis_matrix_dtype": str(getattr(sim, "analysis_matrix_dtype", "uint16")),
     }
 
-    if propagator == "Nominal_Propagator" or propagator == "Kepler_J2_Drag":
+    if propagator in {"Nominal_Propagator", "Kepler_J2_Drag"}:
         out["use_j2"] = bool(getattr(sim, "use_j2", True))
         out["use_drag"] = bool(getattr(sim, "use_drag", False))
         if out["use_drag"]:
@@ -283,32 +291,20 @@ def _sim_metadata_for_propagator(*, sim: SimConfig, propagator: str) -> dict[str
             out["H_km"] = float(getattr(sim, "H_km", 88.667))
             out["rho_scale"] = float(getattr(sim, "rho_scale", 1.0))
             out["drag_floor_alt_km"] = float(getattr(sim, "drag_floor_alt_km", 120.0))
-        return out
 
-    if propagator == "HohmannPy_Cowell":
-        out["hohmannpy_cowell_step_s"] = float(getattr(sim, "hohmannpy_cowell_step_s", 10.0))
-        out["hohmannpy_rtol"] = float(getattr(sim, "hohmannpy_rtol", 1e-9))
-        out["hohmannpy_atol"] = float(getattr(sim, "hohmannpy_atol", 1e-12))
-        out["hohmannpy_use_j2"] = bool(getattr(sim, "hohmannpy_use_j2", getattr(sim, "use_j2", True)))
-        out["hohmannpy_use_drag"] = bool(getattr(sim, "hohmannpy_use_drag", False))
-        return out
-
-    if propagator == "HohmannPy_Kepler":
-        return out
-
-    # Unknown propagator: keep generic fields only.
+    # Unknown propagators fall through with generic fields only.
     return out
 
 
 def _drag_enabled_for_propagator(*, sim: SimConfig, propagator: str) -> bool:
+    """True when the selected propagator will apply atmospheric drag."""
     if propagator in {"Nominal_Propagator", "Kepler_J2_Drag"}:
         return bool(getattr(sim, "use_drag", False))
-    if propagator == "HohmannPy_Cowell":
-        return bool(getattr(sim, "hohmannpy_use_drag", False))
     return False
 
 
 def _strip_drag_fields(value: Any) -> Any:
+    """Remove drag-only fields from metadata when drag is disabled."""
     if isinstance(value, dict):
         return {k: _strip_drag_fields(v) for k, v in value.items() if k != "bc_kg_m2"}
     if isinstance(value, list):
@@ -327,6 +323,25 @@ def run_simulation(
     *,
     propagator: str = "Nominal_Propagator",
 ) -> Analysis:
+    """
+    Run a coverage simulation for a constellation over the target shell.
+
+    Parameters
+    ----------
+    elems0      : vectorized orbital elements at epoch (n_sats per field)
+    phys        : satellite physical properties (ballistic coefficient etc.)
+    sim         : simulation timeframe and propagation settings
+    cov         : engagement parameters and derived interceptor reach
+    earth       : Earth physical constants
+    shell       : target shell (points, normals, lat/lon)
+    layer_specs : constellation composition description, stored in metadata
+    propagator  : registry name of the propagator to use
+
+    Returns
+    -------
+    Analysis with counts[t, p] = number of satellites covering shell point p
+    at timestep t, plus per-point/per-time means and provenance metadata.
+    """
     _assert_isinstance(elems0, OrbitalElements, "elems0")
     _assert_isinstance(phys, SatellitePhysical, "phys")
     _assert_isinstance(sim, SimConfig, "sim")
@@ -353,8 +368,8 @@ def run_simulation(
         )
 
     # --- Propagator selection + initialization ---
-    # Shared COE -> ECI (r,v) conversion at epoch0. Supports vectorized elems0.
-    r0_eci_km, v0_eci_km_s = elements_to_eci_rv_km(elems0, earth)  # (Ns,3) expected for vectorized elems0
+    # Convert classical elements to ECI position/velocity at epoch (Ns, 3).
+    r0_eci_km, v0_eci_km_s = elements_to_eci_rv_km(elems0, earth)
 
     prop = get_propagator(propagator)
     state = prop.init_state(
@@ -366,7 +381,7 @@ def run_simulation(
         earth=earth,
     )
 
-    # --- Main loop (coverage logic unchanged) ---
+    # --- Main loop: propagate, rotate to ECEF, evaluate coverage in chunks ---
     for k, t in enumerate(times_s):
         dt = 0.0 if k == 0 else sim.dt_s
 

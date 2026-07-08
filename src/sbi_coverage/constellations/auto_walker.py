@@ -1,3 +1,6 @@
+"""Walker layer generators that automatically size plane/satellite counts
+from coverage geometry.
+"""
 from __future__ import annotations
 
 import numpy as np

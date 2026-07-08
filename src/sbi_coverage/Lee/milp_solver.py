@@ -65,6 +65,7 @@ _SEPARATOR = "-" * len(_HEADER)
 
 
 def _fmt_time(t: float) -> str:
+    """Format seconds compactly, e.g. 45s, 3m05s, 2h07m."""
     if t < 60:
         return f"{t:.0f}s"
     if t < 3600:
@@ -74,6 +75,7 @@ def _fmt_time(t: float) -> str:
 
 def _progress_row(flag: str, expl: float, rem: float,
                   inc: float | None, bd: float | None, t: float) -> str:
+    """Format one fixed-width row of the B&B progress table."""
     inc_s = f"{inc:.4f}" if inc is not None else "-"
     bd_s  = f"{bd:.4f}"  if bd  is not None else "-"
     if inc is not None and bd is not None and abs(inc) > 1e-10:
@@ -108,11 +110,13 @@ def _make_sclp_callback(header_every: int = 25) -> Callable:
     state = {"rows": 0, "last_rem": 0}
 
     def _maybe_header() -> None:
+        """Reprint the column header every header_every rows."""
         if state["rows"] % header_every == 0:
             print(_HEADER)
             print(_SEPARATOR)
 
     def callback(model: gp.Model, where: int) -> None:
+        """Print progress on new incumbents (MIPSOL) and periodic MIP updates."""
         if where == GRB.Callback.MIPSOL:
             obj  = _sanitize_callback_obj(model.cbGet(GRB.Callback.MIPSOL_OBJ))
             bd   = _sanitize_callback_obj(model.cbGet(GRB.Callback.MIPSOL_OBJBND))
@@ -177,7 +181,7 @@ _GUROBI_STATUS_STRINGS = {
     17: "Memory limit",
 }
 
-# Gurobi statuses from which we can extract a valid incumbent
+# Gurobi statuses that may still carry a valid incumbent solution
 _INCUMBENT_STATUSES = {2, 9, 10, 11, 13, 15}  # Optimal, TimeLimit, SolLimit, Interrupted, Suboptimal, ObjLimit
 
 

@@ -1,3 +1,6 @@
+"""SCLP constellation optimization pipeline after Lee et al. (2020):
+RGT slot construction, access-profile assembly, and MILP solve.
+"""
 from .optimal_altitude import optimal_sat_altitude_km, footprint_half_angles_deg
 from .rgt_ratio import candidate_rgt_ratios
 from .rgt_slots import a_km_j2_rgt, rgt_common_ground_track_layer, rgt_subconstellation_layers, seed_layer
