@@ -1,0 +1,10 @@
+csis/
+docker/
+pyproject.toml
+
+docs/*
+results/*
+
+__pycache__/
+*.pyc
+*.pyo
