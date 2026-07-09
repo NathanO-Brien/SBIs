@@ -23,11 +23,11 @@ def a_km_j2_rgt(N_P: int, N_D: int, inc_deg: float, earth: EarthConstants) -> fl
     """J2-corrected semi-major axis for an RGT orbit (Newton-Raphson).
 
     Finds a (km) satisfying the exact J2 repeating-ground-track condition for
-    the frames.py ECEF convention (ECEF_lon = RAAN + ω_E·t):
+    an eastward-rotating Earth (frames.py convention: ECEF_lon = RAAN − ω_E·t):
 
-        N_P · (ω_E + Ω̇(a)) = N_D · (n_kep(a) + ω̇(a))
+        N_P · (ω_E − Ω̇(a)) = N_D · (n_kep(a) + ω̇(a))
 
-    At the returned a, T_r = N_P · 2π/(n_kep + ω̇) = N_D · 2π/(ω_E + Ω̇) and
+    At the returned a, T_r = N_P · 2π/(n_kep + ω̇) = N_D · 2π/(ω_E − Ω̇) and
     the orbit repeats exactly in ECEF after T_r seconds under the secular J2
     propagator, making the circulant V matrix exact for ALL entries (including
     wrap-around ones).  The Keplerian a from _a_km_from_np_nd() is used as the
@@ -56,7 +56,7 @@ def a_km_j2_rgt(N_P: int, N_D: int, inc_deg: float, earth: EarthConstants) -> fl
         Omegadot = -fac * cos_i
         omegadot = 0.5 * fac * (5.0 * cos2_i - 1.0)
 
-        f = N_P * (earth.omega_earth_rad_s + Omegadot) - N_D * (n + omegadot)
+        f = N_P * (earth.omega_earth_rad_s - Omegadot) - N_D * (n + omegadot)
 
         # Numerical derivative via central difference (1 m step to avoid cancellation)
         da = max(a * 1e-7, 1e-4)
@@ -65,7 +65,7 @@ def a_km_j2_rgt(N_P: int, N_D: int, inc_deg: float, earth: EarthConstants) -> fl
         fac2 = 1.5 * earth.j2 * (earth.r_eq_km / a2)**2 * n2
         Omega2 = -fac2 * cos_i
         omega2 = 0.5 * fac2 * (5.0 * cos2_i - 1.0)
-        f2 = N_P * (earth.omega_earth_rad_s + Omega2) - N_D * (n2 + omega2)
+        f2 = N_P * (earth.omega_earth_rad_s - Omega2) - N_D * (n2 + omega2)
 
         df_da = (f2 - f) / da
         if abs(df_da) < 1e-40:
@@ -100,17 +100,20 @@ def rgt_common_ground_track_layer(
     share a single repeating ground track.  Slot k arrives at each ground track point
     exactly k·Δt later than slot 0 (the seed satellite).  This time offset maps to:
 
-        RAAN_k  = RAAN_0 - k · (ω_E + Ω̇) · T_r / L   (note: + not -, see frames.py sign convention)
+        RAAN_k  = RAAN_0 + k · (ω_E − Ω̇) · T_r / L
         M₀_k    = M₀_0  − k · (2π·N_P/L + ω̇·T_r/L)   (compensates Keplerian advance AND J2 argp drift)
 
     where T_r = N_D · T_sidereal, Ω̇ is the J2 secular RAAN rate, and ω̇ is the J2
     secular argument-of-perigee rate.
 
-    NOTE on sign: frames.py implements eci_to_ecef as r_eci @ rot_z(+ω_E·t), so the
-    apparent ECEF longitude of the ascending node is RAAN + ω_E·t (not RAAN - ω_E·t).
-    With J2, RAAN drifts at Ω̇ (negative for prograde), giving ECEF_AN rate = ω_E + Ω̇.
-    This gives the + sign in the RAAN slot formula.  All corrections are zeroed when
-    use_j2=False to match a propagator running without J2.
+    NOTE on sign: Earth rotates eastward, so a ground-track point's inertial
+    longitude increases with time; the ECEF longitude of the ascending node is
+    RAAN − ω_E·t (frames.py convention, verified in scripts/verify_frames.py).
+    A slot arriving k·Δt LATER at the same ECEF node therefore needs its RAAN
+    shifted EAST by (ω_E − Ω̇)·k·Δt — the + sign in the RAAN formula.  With J2,
+    RAAN drifts at Ω̇ (negative for prograde), giving ECEF node rate Ω̇ − ω_E.
+    All corrections are zeroed when use_j2=False to match a propagator running
+    without J2.
 
     NOTE: This is NOT the same as rgt_layer(n_planes=1), which places all L satellites
     in a single orbital plane (RAAN identical for all slots).  Equal-RAAN slots do NOT
@@ -171,7 +174,7 @@ def rgt_common_ground_track_layer(
     # Slot k must be exactly one simulation time-step (dt_slot) behind slot k-1
     # in both ECEF longitude and argument of latitude:
     #
-    #   RAAN_k = RAAN_0 − k · (ω_E + Ω̇_inc) · dt_slot
+    #   RAAN_k = RAAN_0 + k · (ω_E − Ω̇_inc) · dt_slot
     #   M_k    = M_0    − k · (n_kep + ω̇_inc) · dt_slot
     #
     # dt_slot is the shared simulation dt (T_r_ref / L).  Using the inclination-
@@ -181,7 +184,7 @@ def rgt_common_ground_track_layer(
     # inclination and T_r_ref equals this orbit's own T_r.
     _dt_slot = dt_s if dt_s is not None else T_r / L
 
-    raan_rad = np.deg2rad(raan0_deg) - k * (earth.omega_earth_rad_s + Omegadot) * _dt_slot
+    raan_rad = np.deg2rad(raan0_deg) + k * (earth.omega_earth_rad_s - Omegadot) * _dt_slot
     raan_rad = raan_rad % (2.0 * np.pi)
 
     m0_rad = np.deg2rad(m0_deg) - k * (n_kep + omegadot) * _dt_slot

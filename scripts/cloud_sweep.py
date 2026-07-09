@@ -84,24 +84,24 @@ INCLINATION_SWEEP_BOUNDS_DEG: dict[str, tuple[float, float]] = {
     "Russia":      (40.0, 90.0),
     "Iran":        (20.0, 90.0)
 }
-DEFAULT_INCLINATION_BOUNDS: tuple[float, float] = (20.0, 90.0)
+DEFAULT_INCLINATION_BOUNDS: tuple[float, float] = (0, 90.0)
 
 # ---------------------------------------------------------------------------
 # Sweep grid — mirrors sweep_optimize.py defaults.
 # Change these lists to define the combinations you want to run.
 # ---------------------------------------------------------------------------
-SWEEP_COUNTRIES:                list[str]   = ["North Korea"]
+SWEEP_COUNTRIES:                list[str]   = ["China"]
 SWEEP_ALTITUDES_KM:             list[float] = [260.0, 400.0, 550.0]
-SWEEP_SALVO_SIZES:              list[int]   = [1, 10, 20, 35]
+SWEEP_SALVO_SIZES:              list[int]   = [1, 10, 20, 35, 50, 75, 100]
 SWEEP_INTERCEPTORS_PER_SAT:     list[int]   = [1, 2, 4, 6]
 SWEEP_BURNOUT_VELOCITIES_KM_S:  list[float] = [4.0, 5.0, 6.0, 10.0]
-SEEDS_FOR_MILP_BY_SALVO:        dict  = {1: 5, # 10
-                                        5: 10,  # 15
-                                        20: 15, # 20
-                                        35: 20, # 30
-                                        50: 25, # 40
-                                        75: 30, # 45
-                                        100: 40} # 50
+SEEDS_FOR_MILP_BY_SALVO:        dict  = {1: 10, # 5
+                                        5: 15,  # 10
+                                        20: 20, # 15
+                                        35: 25, # 20
+                                        50: 30, # 25
+                                        75: 40, # 30
+                                        100: 50} # 40
 
 # ---------------------------------------------------------------------------
 # Helpers

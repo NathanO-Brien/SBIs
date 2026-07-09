@@ -40,18 +40,174 @@ AWS_REGION:       str = "us-east-1"
 # ---------------------------------------------------------------------------
 
 # Target
-TARGET_MODE:            str   = "country"       # "country" or "prespecified"
+TARGET_MODE:            str   = "prespecified"  # "country" or "prespecified"
 TARGET_COUNTRY:         str   = "China"
 TARGET_SHELL_N_POINTS:  int   = 15000
 INCLINATION_SWEEP_BOUNDS_DEG: dict[str, tuple[float, float]] = {
     "China":       (20.0, 90.0),
     "North Korea": (35.0, 90.0),
 }
-DEFAULT_INCLINATION_BOUNDS: tuple[float, float] = (20.0, 90.0)
+DEFAULT_INCLINATION_BOUNDS: tuple[float, float] = (0, 90.0)
+
+# Three 50-point blobs over open Pacific Ocean, far from any landmass or
+# island chain: mid-latitude North Pacific, equatorial Pacific, and the
+# South Pacific oceanic pole of inaccessibility ("Point Nemo" region).
+TARGET_POINTS: list[list] = [
+    ["Pacific-N-01", 34.0, -152.0],
+    ["Pacific-N-02", 34.0, -151.5556],
+    ["Pacific-N-03", 34.0, -151.1111],
+    ["Pacific-N-04", 34.0, -150.6667],
+    ["Pacific-N-05", 34.0, -150.2222],
+    ["Pacific-N-06", 34.0, -149.7778],
+    ["Pacific-N-07", 34.0, -149.3333],
+    ["Pacific-N-08", 34.0, -148.8889],
+    ["Pacific-N-09", 34.0, -148.4444],
+    ["Pacific-N-10", 34.0, -148.0],
+    ["Pacific-N-11", 34.5, -152.0],
+    ["Pacific-N-12", 34.5, -151.5556],
+    ["Pacific-N-13", 34.5, -151.1111],
+    ["Pacific-N-14", 34.5, -150.6667],
+    ["Pacific-N-15", 34.5, -150.2222],
+    ["Pacific-N-16", 34.5, -149.7778],
+    ["Pacific-N-17", 34.5, -149.3333],
+    ["Pacific-N-18", 34.5, -148.8889],
+    ["Pacific-N-19", 34.5, -148.4444],
+    ["Pacific-N-20", 34.5, -148.0],
+    ["Pacific-N-21", 35.0, -152.0],
+    ["Pacific-N-22", 35.0, -151.5556],
+    ["Pacific-N-23", 35.0, -151.1111],
+    ["Pacific-N-24", 35.0, -150.6667],
+    ["Pacific-N-25", 35.0, -150.2222],
+    ["Pacific-N-26", 35.0, -149.7778],
+    ["Pacific-N-27", 35.0, -149.3333],
+    ["Pacific-N-28", 35.0, -148.8889],
+    ["Pacific-N-29", 35.0, -148.4444],
+    ["Pacific-N-30", 35.0, -148.0],
+    ["Pacific-N-31", 35.5, -152.0],
+    ["Pacific-N-32", 35.5, -151.5556],
+    ["Pacific-N-33", 35.5, -151.1111],
+    ["Pacific-N-34", 35.5, -150.6667],
+    ["Pacific-N-35", 35.5, -150.2222],
+    ["Pacific-N-36", 35.5, -149.7778],
+    ["Pacific-N-37", 35.5, -149.3333],
+    ["Pacific-N-38", 35.5, -148.8889],
+    ["Pacific-N-39", 35.5, -148.4444],
+    ["Pacific-N-40", 35.5, -148.0],
+    ["Pacific-N-41", 36.0, -152.0],
+    ["Pacific-N-42", 36.0, -151.5556],
+    ["Pacific-N-43", 36.0, -151.1111],
+    ["Pacific-N-44", 36.0, -150.6667],
+    ["Pacific-N-45", 36.0, -150.2222],
+    ["Pacific-N-46", 36.0, -149.7778],
+    ["Pacific-N-47", 36.0, -149.3333],
+    ["Pacific-N-48", 36.0, -148.8889],
+    ["Pacific-N-49", 36.0, -148.4444],
+    ["Pacific-N-50", 36.0, -148.0],
+    ["Pacific-Eq-01", -1.0, -142.0],
+    ["Pacific-Eq-02", -1.0, -141.5556],
+    ["Pacific-Eq-03", -1.0, -141.1111],
+    ["Pacific-Eq-04", -1.0, -140.6667],
+    ["Pacific-Eq-05", -1.0, -140.2222],
+    ["Pacific-Eq-06", -1.0, -139.7778],
+    ["Pacific-Eq-07", -1.0, -139.3333],
+    ["Pacific-Eq-08", -1.0, -138.8889],
+    ["Pacific-Eq-09", -1.0, -138.4444],
+    ["Pacific-Eq-10", -1.0, -138.0],
+    ["Pacific-Eq-11", -0.5, -142.0],
+    ["Pacific-Eq-12", -0.5, -141.5556],
+    ["Pacific-Eq-13", -0.5, -141.1111],
+    ["Pacific-Eq-14", -0.5, -140.6667],
+    ["Pacific-Eq-15", -0.5, -140.2222],
+    ["Pacific-Eq-16", -0.5, -139.7778],
+    ["Pacific-Eq-17", -0.5, -139.3333],
+    ["Pacific-Eq-18", -0.5, -138.8889],
+    ["Pacific-Eq-19", -0.5, -138.4444],
+    ["Pacific-Eq-20", -0.5, -138.0],
+    ["Pacific-Eq-21", 0.0, -142.0],
+    ["Pacific-Eq-22", 0.0, -141.5556],
+    ["Pacific-Eq-23", 0.0, -141.1111],
+    ["Pacific-Eq-24", 0.0, -140.6667],
+    ["Pacific-Eq-25", 0.0, -140.2222],
+    ["Pacific-Eq-26", 0.0, -139.7778],
+    ["Pacific-Eq-27", 0.0, -139.3333],
+    ["Pacific-Eq-28", 0.0, -138.8889],
+    ["Pacific-Eq-29", 0.0, -138.4444],
+    ["Pacific-Eq-30", 0.0, -138.0],
+    ["Pacific-Eq-31", 0.5, -142.0],
+    ["Pacific-Eq-32", 0.5, -141.5556],
+    ["Pacific-Eq-33", 0.5, -141.1111],
+    ["Pacific-Eq-34", 0.5, -140.6667],
+    ["Pacific-Eq-35", 0.5, -140.2222],
+    ["Pacific-Eq-36", 0.5, -139.7778],
+    ["Pacific-Eq-37", 0.5, -139.3333],
+    ["Pacific-Eq-38", 0.5, -138.8889],
+    ["Pacific-Eq-39", 0.5, -138.4444],
+    ["Pacific-Eq-40", 0.5, -138.0],
+    ["Pacific-Eq-41", 1.0, -142.0],
+    ["Pacific-Eq-42", 1.0, -141.5556],
+    ["Pacific-Eq-43", 1.0, -141.1111],
+    ["Pacific-Eq-44", 1.0, -140.6667],
+    ["Pacific-Eq-45", 1.0, -140.2222],
+    ["Pacific-Eq-46", 1.0, -139.7778],
+    ["Pacific-Eq-47", 1.0, -139.3333],
+    ["Pacific-Eq-48", 1.0, -138.8889],
+    ["Pacific-Eq-49", 1.0, -138.4444],
+    ["Pacific-Eq-50", 1.0, -138.0],
+    ["Pacific-S-01", -49.8, -125.4],
+    ["Pacific-S-02", -49.8, -124.9556],
+    ["Pacific-S-03", -49.8, -124.5111],
+    ["Pacific-S-04", -49.8, -124.0667],
+    ["Pacific-S-05", -49.8, -123.6222],
+    ["Pacific-S-06", -49.8, -123.1778],
+    ["Pacific-S-07", -49.8, -122.7333],
+    ["Pacific-S-08", -49.8, -122.2889],
+    ["Pacific-S-09", -49.8, -121.8444],
+    ["Pacific-S-10", -49.8, -121.4],
+    ["Pacific-S-11", -49.3, -125.4],
+    ["Pacific-S-12", -49.3, -124.9556],
+    ["Pacific-S-13", -49.3, -124.5111],
+    ["Pacific-S-14", -49.3, -124.0667],
+    ["Pacific-S-15", -49.3, -123.6222],
+    ["Pacific-S-16", -49.3, -123.1778],
+    ["Pacific-S-17", -49.3, -122.7333],
+    ["Pacific-S-18", -49.3, -122.2889],
+    ["Pacific-S-19", -49.3, -121.8444],
+    ["Pacific-S-20", -49.3, -121.4],
+    ["Pacific-S-21", -48.8, -125.4],
+    ["Pacific-S-22", -48.8, -124.9556],
+    ["Pacific-S-23", -48.8, -124.5111],
+    ["Pacific-S-24", -48.8, -124.0667],
+    ["Pacific-S-25", -48.8, -123.6222],
+    ["Pacific-S-26", -48.8, -123.1778],
+    ["Pacific-S-27", -48.8, -122.7333],
+    ["Pacific-S-28", -48.8, -122.2889],
+    ["Pacific-S-29", -48.8, -121.8444],
+    ["Pacific-S-30", -48.8, -121.4],
+    ["Pacific-S-31", -48.3, -125.4],
+    ["Pacific-S-32", -48.3, -124.9556],
+    ["Pacific-S-33", -48.3, -124.5111],
+    ["Pacific-S-34", -48.3, -124.0667],
+    ["Pacific-S-35", -48.3, -123.6222],
+    ["Pacific-S-36", -48.3, -123.1778],
+    ["Pacific-S-37", -48.3, -122.7333],
+    ["Pacific-S-38", -48.3, -122.2889],
+    ["Pacific-S-39", -48.3, -121.8444],
+    ["Pacific-S-40", -48.3, -121.4],
+    ["Pacific-S-41", -47.8, -125.4],
+    ["Pacific-S-42", -47.8, -124.9556],
+    ["Pacific-S-43", -47.8, -124.5111],
+    ["Pacific-S-44", -47.8, -124.0667],
+    ["Pacific-S-45", -47.8, -123.6222],
+    ["Pacific-S-46", -47.8, -123.1778],
+    ["Pacific-S-47", -47.8, -122.7333],
+    ["Pacific-S-48", -47.8, -122.2889],
+    ["Pacific-S-49", -47.8, -121.8444],
+    ["Pacific-S-50", -47.8, -121.4],
+]
 
 # Engagement geometry
-V_BO_KM_S:          float = 4.0
-SALVO_SIZE:         int   = 1
+V_BO_KM_S:          float = 6.0
+SALVO_SIZE:         int   = 10
 N_INTERCEPTORS_PER_SAT: int = 1
 T_WINDOW_S:         float = 170.0
 A_G:                float = 10.0
@@ -59,8 +215,8 @@ INTERCEPT_ALT_KM:   float = 200.0
 MIN_ELEV_DEG:       float = 0.0
 
 # Orbit
-ALTITUDE_OVERRIDE_KM:     float | None = 250.0   # None → use geometric h*
-ALTITUDE_MAX_REPEAT_DAYS: int          = 1
+ALTITUDE_OVERRIDE_KM:     float | None = 400.0   # None → use geometric h*
+ALTITUDE_MAX_REPEAT_DAYS: int          = 2
 USE_J2:                   bool         = False
 
 # Seed grid
@@ -68,12 +224,12 @@ DT_S:               float = 120.0
 INC_SCREEN_STEP_DEG: float = 1.0
 N_RAAN_OFFSETS:     int   = 10
 SEED_WORKERS:       int   = 8
-N_SEEDS_FOR_MILP:   int   = 10
+N_SEEDS_FOR_MILP:   int   = 25
 RESERVE_POLAR_ORBITS: bool = False
 
 # Solver
 MIP_GAP:        float = 0.01
-TIME_LIMIT_S:   float = 300.0
+TIME_LIMIT_S:   float = 14400.0
 MIP_FOCUS:      int   = 1
 HEURISTICS_FRAC: float = 0.2
 SOLVER_PARAMS:  dict  = {
@@ -101,8 +257,9 @@ def main() -> None:
         description="Submit a single SBI SCLP optimization job to AWS Batch."
     )
 
-    # Target — mutually exclusive: country or prespecified points
-    target_group = parser.add_mutually_exclusive_group(required=True)
+    # Target — mutually exclusive: country or prespecified points.
+    # If neither is passed, falls back to TARGET_MODE / TARGET_POINTS / TARGET_COUNTRY above.
+    target_group = parser.add_mutually_exclusive_group(required=False)
     target_group.add_argument(
         "--country",
         help="Target country name (e.g. 'China'). Sets country mode.",
@@ -164,7 +321,7 @@ def main() -> None:
             INCLINATION_SWEEP_BOUNDS_DEG.get(country, DEFAULT_INCLINATION_BOUNDS)
         )
         slug = country.lower().replace(" ", "-")
-    else:
+    elif args.target_points:
         target_mode   = "prespecified"
         country       = None
         target_points = []
@@ -176,6 +333,20 @@ def main() -> None:
             target_points.append([name, lat, lon])
         inc_bounds = list(args.inc_bounds) if args.inc_bounds else list(DEFAULT_INCLINATION_BOUNDS)
         slug = target_points[0][0].lower().replace(" ", "-").replace(":", "").replace("/", "-")[:20]
+    elif TARGET_MODE == "country":
+        target_mode   = "country"
+        country       = TARGET_COUNTRY
+        target_points = None
+        inc_bounds = list(args.inc_bounds) if args.inc_bounds else list(
+            INCLINATION_SWEEP_BOUNDS_DEG.get(country, DEFAULT_INCLINATION_BOUNDS)
+        )
+        slug = country.lower().replace(" ", "-")
+    else:
+        target_mode   = "prespecified"
+        country       = None
+        target_points = TARGET_POINTS
+        inc_bounds = list(args.inc_bounds) if args.inc_bounds else list(DEFAULT_INCLINATION_BOUNDS)
+        slug = "pacific-3-blobs"
 
     job_name = args.job_name or (
         f"run_{ts}_{slug}"

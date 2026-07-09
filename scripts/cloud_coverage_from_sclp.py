@@ -85,7 +85,7 @@ RENDER_SHELL_N_POINTS: int = 15000
 # Output flags
 # ---------------------------------------------------------------------------
 PLOT_INITIAL_ORBITS:        bool      = False
-RENDER_COVERAGE_VIDEO:      bool      = True
+RENDER_COVERAGE_VIDEO:      bool      = False
 COVERAGE_VIDEO_OUTPUT_PATH: str | None = None   # None = auto-named in docs/videos/
 
 

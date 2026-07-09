@@ -34,7 +34,7 @@ import numpy as np
 # Configuration
 # ---------------------------------------------------------------------------
 RESULTS_ROOT: Path = Path(__file__).resolve().parents[1] / "results"
-COUNTRY_NAME: str  = "China"   # Display name; folder slug is derived automatically
+COUNTRY_NAME: str  = "North Korea"   # Display name; folder slug is derived automatically
 SHOW_PLOT: bool    = True
 
 

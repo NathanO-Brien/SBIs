@@ -41,7 +41,7 @@ AWS_REGION: str = "us-east-1"
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-COUNTRY_NAME: str  = "China"   # Default; override with --country
+COUNTRY_NAME: str  = "North Korea"   # Default; override with --country
 SHOW_PLOT:    bool = True
 
 # Local results root used when --save-local is passed.

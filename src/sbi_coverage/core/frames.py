@@ -21,15 +21,23 @@ def rot_z(theta: float) -> np.ndarray:
 
 def ecef_to_eci(points_ecef_km: np.ndarray, t_s: float, earth: EarthConstants) -> np.ndarray:
     """Rotate Earth-fixed points (N, 3) into the inertial frame at time t_s
-    seconds after frame alignment."""
+    seconds after frame alignment.
+
+    Earth rotates eastward (+omega about +Z), so a fixed ground point's
+    inertial longitude increases with time.
+    """
     theta = earth.omega_earth_rad_s * t_s
     R = rot_z(theta)
-    return points_ecef_km @ R.T
+    return points_ecef_km @ R
 
 
 def eci_to_ecef(points_eci_km: np.ndarray, t_s: float, earth: EarthConstants) -> np.ndarray:
     """Rotate inertial points (N, 3) into the Earth-fixed frame at time t_s
-    seconds after frame alignment."""
+    seconds after frame alignment.
+
+    Verified against a geostationary orbit (stationary ECEF position) and
+    prograde-LEO westward node drift; see scripts/verify_frames.py.
+    """
     theta = earth.omega_earth_rad_s * t_s
     R = rot_z(theta)
-    return points_eci_km @ R
+    return points_eci_km @ R.T

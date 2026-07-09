@@ -44,7 +44,7 @@ TARGET_POINTS: list[tuple[str, float, float]] = [
 ]
 
 # For use in country mode
-TARGET_COUNTRY: str | list[str] | tuple[str, ...] = "China"
+TARGET_COUNTRY: str | list[str] | tuple[str, ...] = "Brazil"
 TARGET_SHELL_N_POINTS: int = 15000
 
 # Time discretization
@@ -58,7 +58,7 @@ INTERCEPT_ALT_KM: float = 200.0
 MIN_ELEV_DEG: float = 0.0
 
 # Inclination sweep configuration
-INCLINATION_SWEEP_BOUNDS_DEG: tuple[float, float] = (20.0, 90.0)
+INCLINATION_SWEEP_BOUNDS_DEG: tuple[float, float] = (0, 90.0)
 INCLINATION_SCREEN_STEP_DEG: float = 1
 
 # Altitude family configuration
@@ -86,11 +86,11 @@ USE_J2: bool = False
 # for the chosen RGT orbit.  Offsets outside this range are periodic repeats
 # of the same N_P orbital planes and add no new coverage geometry.
 # Recommended: 3–5 for country targets; 1 is sufficient for point targets.
-N_RAAN_OFFSETS: int = 10
+N_RAAN_OFFSETS: int = 5
 SEED_SCREENING_WORKERS: int = 8
 # Number of seed orbits passed to the MILP after greedy marginal-coverage
 # ranking.  All seeds are simulated; only the best N are given to Gurobi.
-N_SEEDS_FOR_MILP: int = 20
+N_SEEDS_FOR_MILP: int = 10
 # When True, three polar seeds are reserved before the greedy runs — one each
 # at inc = 80°, 85°, and 90°.  For each inclination the seed with the highest
 # total target access (best RAAN) is chosen from the simulated pool.  Seeds
@@ -102,14 +102,14 @@ RESERVE_POLAR_ORBITS: bool = False
 # ---------------------------------------------------------------------------
 # Intercept salvo parameters
 # ---------------------------------------------------------------------------
-SALVO_SIZE: int = 1
+SALVO_SIZE: int = 2
 N_INTERCEPTORS_PER_SAT: int = 1
 
 # ---------------------------------------------------------------------------
 # Solver options
 # ---------------------------------------------------------------------------
 MIP_GAP: float = 0.001
-TIME_LIMIT_S: float = 20000
+TIME_LIMIT_S: float = 45
 # MIPFocus=1: prioritise finding feasible incumbents fast (best for sweep / large
 # grids where the first solution is hard to find).  Switch to 2 when you want
 # Gurobi to focus on proving optimality once a good incumbent already exists.
