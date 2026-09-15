@@ -4,6 +4,8 @@ pyproject.toml
 
 docs/*
 results/*
+logFiles/
+tmp/
 
 __pycache__/
 *.pyc

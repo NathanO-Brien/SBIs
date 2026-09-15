@@ -241,7 +241,11 @@ def main() -> None:
                                else float(s["dt_s"]),
         use_j2=                bool(s.get("use_j2",  False)),
         use_drag=              bool(s.get("use_drag", False)),
-        analysis_matrix_dtype= str(s.get("analysis_matrix_dtype", "uint8")),
+        # Force uint16 regardless of what the original optimizer run used.
+        # The stored value is often "uint8" (max 255), fine for single-satellite
+        # seed sims but silently overflows when re-simulating all selected
+        # satellites together if any point is covered by >255 at once.
+        analysis_matrix_dtype= "uint16",
     )
 
     propagator = str(cfg.get("propagator", "Nominal_Propagator"))

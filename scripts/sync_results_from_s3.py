@@ -4,13 +4,19 @@ sync_results_from_s3.py
 Downloads the best result for every unique scenario from S3 into the local
 results/ folder using an abbreviated hierarchy to stay under Windows MAX_PATH.
 
+Scans both target modes:
+    country/{country}/...          -> results/{country}/...
+    prespecified/{target-name}/... -> results/prespecified/{target-name}/...
+
 A "scenario" is fully defined by the S3 leaf folder:
-    country/{country}/target-points-{N}/intercept-alt-{h}km/orbit-alt-{alt}km/
+    <mode>/<target-name>/target-points-{N}/intercept-alt-{h}km/orbit-alt-{alt}km/
     burnout-vel-{v}km-s/intercept-window-{w}s/max-accel-{g}g/
     interceptors-per-sat-{n}/doctrine-{d}/salvo-size-{s}/
 
 Locally the same hierarchy is stored with abbreviated segment names:
-    results/{country}/tp-{N}/ia-{h}/oa-{alt}/vbo-{v}/tw-{w}/ag-{g}/int-{n}/doc-{d}/sal-{s}/
+    results/{target}/tp-{N}/ia-{h}/oa-{alt}/vbo-{v}/tw-{w}/ag-{g}/int-{n}/doc-{d}/sal-{s}/
+(the leading "country" segment is dropped locally; "prespecified" is kept so
+blob runs are clearly separated from country runs)
 
 When multiple runs exist in the same leaf folder, the one with the fewest
 satellites (lowest n_satellites in the JSON) is downloaded.  All four files
@@ -40,7 +46,7 @@ import boto3
 # ---------------------------------------------------------------------------
 S3_BUCKET:    str  = "sbi-optimization-runs"
 AWS_REGION:   str  = "us-east-1"
-S3_PREFIX:    str  = "country/"
+S3_PREFIXES:  list[str] = ["country/", "prespecified/"]
 LOCAL_ROOT:   Path = Path("results")
 
 # Suffixes that constitute a complete run
@@ -82,7 +88,8 @@ def _s3_leaf_to_local(s3_leaf: str) -> Path:
            ag-10.0g/int-1/doc-1x/sal-10/
     """
     parts = [p for p in s3_leaf.split("/") if p]
-    # Drop the leading "country" segment — redundant with LOCAL_ROOT
+    # Drop the leading "country" segment — redundant with LOCAL_ROOT.
+    # Keep "prespecified" so blob runs stay clearly separated locally.
     if parts and parts[0] == "country":
         parts = parts[1:]
     abbreviated = [_abbreviate_segment(p) for p in parts]
@@ -121,20 +128,20 @@ def main(download: bool, overwrite: bool) -> None:
     s3        = boto3.client("s3", region_name=AWS_REGION)
     paginator = s3.get_paginator("list_objects_v2")
 
-    print(f"Scanning s3://{S3_BUCKET}/{S3_PREFIX} ...")
-
     # ------------------------------------------------------------------
-    # Pass 1: collect all S3 keys grouped by leaf folder
+    # Pass 1: collect all S3 keys grouped by leaf folder (both modes)
     # ------------------------------------------------------------------
     # leaf_folder -> list of all keys under that folder
     folder_keys: dict[str, list[str]] = defaultdict(list)
 
-    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_PREFIX):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            leaf = _leaf_folder(key)
-            if leaf:
-                folder_keys[leaf].append(key)
+    for prefix in S3_PREFIXES:
+        print(f"Scanning s3://{S3_BUCKET}/{prefix} ...")
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                leaf = _leaf_folder(key)
+                if leaf:
+                    folder_keys[leaf].append(key)
 
     print(f"Found {len(folder_keys)} unique leaf scenario folder(s).\n")
 

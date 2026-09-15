@@ -90,8 +90,8 @@ DEFAULT_INCLINATION_BOUNDS: tuple[float, float] = (0, 90.0)
 # Sweep grid — mirrors sweep_optimize.py defaults.
 # Change these lists to define the combinations you want to run.
 # ---------------------------------------------------------------------------
-SWEEP_COUNTRIES:                list[str]   = ["China"]
-SWEEP_ALTITUDES_KM:             list[float] = [260.0, 400.0, 550.0]
+SWEEP_COUNTRIES:                list[str]   = ["Iran"]
+SWEEP_ALTITUDES_KM:             list[float] = [400.0]
 SWEEP_SALVO_SIZES:              list[int]   = [1, 10, 20, 35, 50, 75, 100]
 SWEEP_INTERCEPTORS_PER_SAT:     list[int]   = [1, 2, 4, 6]
 SWEEP_BURNOUT_VELOCITIES_KM_S:  list[float] = [4.0, 5.0, 6.0, 10.0]
@@ -99,8 +99,8 @@ SEEDS_FOR_MILP_BY_SALVO:        dict  = {1: 10, # 5
                                         5: 15,  # 10
                                         20: 20, # 15
                                         35: 25, # 20
-                                        50: 30, # 25
-                                        75: 40, # 30
+                                        50: 35, # 25
+                                        75: 45, # 30
                                         100: 50} # 40
 
 # ---------------------------------------------------------------------------
