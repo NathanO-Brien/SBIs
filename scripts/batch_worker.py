@@ -84,7 +84,13 @@ _INC_SCREEN_STEP_DEG: float     = 1.0
 _ALTITUDE_MAX_REPEAT_DAYS: int  = 1
 _N_RAAN_OFFSETS: int            = 10
 _SEED_WORKERS: int              = 8
-_SEEDS_FOR_MILP_BY_SALVO: dict[int, int] = {
+# Keyed on r_required = ceil(salvo_size / n_interceptors_per_sat), not on
+# salvo_size directly — the greedy pool must be large enough for the
+# solver to find r_required satellites simultaneously in view of every
+# target, and that's the quantity that actually drives feasibility/
+# difficulty, not salvo_size alone. See the "Two-Stage Hybrid" discussion
+# in docs/paper/sbi_optimization_paper.tex for the reasoning.
+_SEEDS_FOR_MILP_BY_R_REQUIRED: dict[int, int] = {
     1:   25,
     5:   25,
     20:  50,
@@ -138,10 +144,11 @@ _CONFIG_DEFAULTS: dict = {
     "mip_gap":                      0.01,
     "time_limit_s":                 None,    # required
     "altitude_max_repeat_days":     1,
-    # Seed count — set n_seeds_for_milp (flat int) OR seeds_for_milp_by_salvo (dict).
-    # If both are present, n_seeds_for_milp takes precedence.
+    # Seed count — set n_seeds_for_milp (flat int) OR seeds_for_milp_by_r_required
+    # (dict, keyed on r_required = ceil(salvo_size / n_interceptors_per_sat), not
+    # on salvo_size). If both are present, n_seeds_for_milp takes precedence.
     "n_seeds_for_milp":             None,    # flat int; if None, falls back to dict below
-    "seeds_for_milp_by_salvo":      {1: 25, 5: 25, 20: 50, 50: 100, 100: 150},
+    "seeds_for_milp_by_r_required": {1: 25, 5: 25, 20: 50, 50: 100, 100: 150},
     # Simulation parameters
     "dt_s":                         120.0,
     "t_window_s":                   170.0,
@@ -345,7 +352,7 @@ def _load_config(s3_uri: str) -> dict:
         float(x) for x in cfg["inclination_sweep_bounds_deg"]
     ]
     cfg["altitude_max_repeat_days"]     = int(cfg["altitude_max_repeat_days"])
-    cfg["seeds_for_milp_by_salvo"]      = {int(k): int(v) for k, v in cfg["seeds_for_milp_by_salvo"].items()}
+    cfg["seeds_for_milp_by_r_required"] = {int(k): int(v) for k, v in cfg["seeds_for_milp_by_r_required"].items()}
     cfg["n_seeds_for_milp"]             = (
         int(cfg["n_seeds_for_milp"]) if cfg.get("n_seeds_for_milp") is not None else None
     )
@@ -477,16 +484,20 @@ def _greedy_select_seeds(
     return selected
 
 
-def _seeds_for_salvo(salvo_size: int, lookup: dict[int, int]) -> int:
-    """Return MILP seed count for salvo_size from the provided lookup dict.
+def _seeds_for_r_required(r_required: int, lookup: dict[int, int]) -> int:
+    """Return MILP seed count for r_required from the provided lookup dict.
 
-    Finds the largest key ≤ salvo_size; falls back to the smallest key if
-    salvo_size is below all defined keys.
+    r_required = ceil(salvo_size / n_interceptors_per_sat) is the number of
+    satellites that must be simultaneously in view of a target — the
+    quantity that actually governs how large the greedy-selected seed pool
+    needs to be, not salvo_size on its own. Finds the largest key ≤
+    r_required; falls back to the smallest key if r_required is below all
+    defined keys.
     """
     keys   = sorted(lookup)
     result = lookup[keys[0]]
     for k in keys:
-        if k <= salvo_size:
+        if k <= r_required:
             result = lookup[k]
         else:
             break
@@ -796,7 +807,7 @@ def main() -> None:
     if cfg.get("n_seeds_for_milp") is not None:
         n_seeds_for_milp = int(cfg["n_seeds_for_milp"])
     else:
-        n_seeds_for_milp = _seeds_for_salvo(cfg["salvo_size"], cfg["seeds_for_milp_by_salvo"])
+        n_seeds_for_milp = _seeds_for_r_required(r_required, cfg["seeds_for_milp_by_r_required"])
     inc_deg_list = [float(p[0]) for p in seed_pairs]
     greedy_idx   = _greedy_select_seeds(
         v0_list, r_required, n_seeds_for_milp,

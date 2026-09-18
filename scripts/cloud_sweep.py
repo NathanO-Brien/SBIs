@@ -95,13 +95,19 @@ SWEEP_ALTITUDES_KM:             list[float] = [400.0]
 SWEEP_SALVO_SIZES:              list[int]   = [1, 10, 20, 35, 50, 75, 100]
 SWEEP_INTERCEPTORS_PER_SAT:     list[int]   = [1, 2, 4, 6]
 SWEEP_BURNOUT_VELOCITIES_KM_S:  list[float] = [4.0, 5.0, 6.0, 10.0]
-SEEDS_FOR_MILP_BY_SALVO:        dict  = {1: 10, # 5
-                                        5: 15,  # 10
-                                        20: 20, # 15
-                                        35: 25, # 20
-                                        50: 35, # 25
-                                        75: 45, # 30
-                                        100: 50} # 40
+# Keyed on r_required = ceil(salvo_size / n_interceptors_per_sat), not on
+# salvo_size directly — the greedy pool must be large enough for the solver
+# to find r_required satellites simultaneously in view of every target, and
+# that's the quantity that actually drives feasibility/difficulty. Two jobs
+# with the same salvo_size but different n_interceptors_per_sat can need very
+# different pool sizes; keying on salvo_size alone ignored that.
+SEEDS_FOR_MILP_BY_R_REQUIRED:   dict  = {1: 10,
+                                        5: 15,
+                                        20: 20,
+                                        35: 25,
+                                        50: 35,
+                                        75: 45,
+                                        100: 50}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -136,7 +142,7 @@ def _config_for(
         "mip_gap":                      MIP_GAP,
         "time_limit_s":                 TIME_LIMIT_S,
         "altitude_max_repeat_days":     ALTITUDE_MAX_REPEAT_DAYS,
-        "seeds_for_milp_by_salvo":      SEEDS_FOR_MILP_BY_SALVO,
+        "seeds_for_milp_by_r_required": SEEDS_FOR_MILP_BY_R_REQUIRED,
         "dt_s":                         DT_S,
         "t_window_s":                   T_WINDOW_S,
         "a_g":                          A_G,

@@ -82,15 +82,22 @@ INCLINATION_SCREEN_STEP_DEG: float                = 1.0
 ALTITUDE_MAX_REPEAT_DAYS: int                     = 1
 N_RAAN_OFFSETS: int                               = 10
 SEED_SCREENING_WORKERS: int                       = 8
-# Number of MILP seeds per salvo size.
-# The lookup uses the largest key ≤ salvo_size, so intermediate values inherit
-# the next lower tier.  Add or change entries here to adjust the mapping.
-SEEDS_FOR_MILP_BY_SALVO: dict[int, int] = {
-    1:   25,   # salvo  1 → 10 seeds
-    5:   25,   # salvo  5 → 25 seeds  (also covers salvo 10 via step-down rule)
-    20:  50,   # salvo 20 → 50 seeds
-    50: 100,   # salvo 50 → 100 seeds
-    100: 150,  # salvo 100 → 150 seeds
+# Number of MILP seeds per coverage requirement.
+# Keyed on r_required = ceil(salvo_size / n_interceptors_per_sat), not on
+# salvo_size directly — the greedy pool must be large enough for the solver
+# to find r_required satellites simultaneously in view of every target, and
+# that's the quantity that actually drives feasibility/difficulty. Two runs
+# with the same salvo_size but different n_interceptors_per_sat can need
+# very different pool sizes; keying on salvo_size alone ignored that.
+# The lookup uses the largest key ≤ r_required, so intermediate values
+# inherit the next lower tier.  Add or change entries here to adjust the
+# mapping.
+SEEDS_FOR_MILP_BY_R_REQUIRED: dict[int, int] = {
+    1:   25,   # r_required  1 → 25 seeds
+    5:   25,   # r_required  5 → 25 seeds  (also covers r_required 10 via step-down rule)
+    20:  50,   # r_required 20 → 50 seeds
+    50: 100,   # r_required 50 → 100 seeds
+    100: 150,  # r_required 100 → 150 seeds
 }
 RESERVE_POLAR_ORBITS: bool                        = False
 MIP_FOCUS: int                                    = 1
@@ -145,27 +152,30 @@ _POLAR_RESERVATION_INCLINATIONS: tuple[float, ...] = (80.0, 85.0, 90.0)
 
 
 # ---------------------------------------------------------------------------
-# Salvo → seed count lookup
+# Coverage requirement → seed count lookup
 # ---------------------------------------------------------------------------
 
-def _seeds_for_salvo(salvo_size: int) -> int:
-    """Return the MILP seed count for *salvo_size* from SEEDS_FOR_MILP_BY_SALVO.
+def _seeds_for_r_required(r_required: int) -> int:
+    """Return the MILP seed count for *r_required* from SEEDS_FOR_MILP_BY_R_REQUIRED.
 
-    Finds the largest key ≤ salvo_size and returns its value, so intermediate
-    salvo values inherit the next lower tier.  Falls back to the smallest key
-    if salvo_size is below all defined keys.
+    r_required = ceil(salvo_size / n_interceptors_per_sat) is the number of
+    satellites that must be simultaneously in view of a target — the
+    quantity that actually governs how large the greedy-selected seed pool
+    needs to be. Finds the largest key ≤ r_required and returns its value,
+    so intermediate values inherit the next lower tier. Falls back to the
+    smallest key if r_required is below all defined keys.
 
     Examples (with default mapping):
-        salvo=1  → 10   (exact match)
-        salvo=10 → 25   (largest key ≤ 10 is 5)
-        salvo=20 → 50   (exact match)
-        salvo=75 → 100  (largest key ≤ 75 is 50)
+        r_required=1  → 25   (exact match)
+        r_required=10 → 25   (largest key ≤ 10 is 5)
+        r_required=20 → 50   (exact match)
+        r_required=75 → 100  (largest key ≤ 75 is 50)
     """
-    keys   = sorted(SEEDS_FOR_MILP_BY_SALVO)
-    result = SEEDS_FOR_MILP_BY_SALVO[keys[0]]   # fallback: smallest tier
+    keys   = sorted(SEEDS_FOR_MILP_BY_R_REQUIRED)
+    result = SEEDS_FOR_MILP_BY_R_REQUIRED[keys[0]]   # fallback: smallest tier
     for k in keys:
-        if k <= salvo_size:
-            result = SEEDS_FOR_MILP_BY_SALVO[k]
+        if k <= r_required:
+            result = SEEDS_FOR_MILP_BY_R_REQUIRED[k]
         else:
             break
     return result
@@ -620,9 +630,10 @@ def run_single(
     # Seed selection: dead-filter → greedy rank → top N to MILP
     # ------------------------------------------------------------------
     r_required      = int(np.ceil(salvo_size / n_interceptors_per_sat))
-    n_seeds_for_milp = _seeds_for_salvo(salvo_size)
-    print(f"\nSeed budget: salvo_size={salvo_size} → n_seeds_for_milp={n_seeds_for_milp}"
-          f"  (from SEEDS_FOR_MILP_BY_SALVO)")
+    n_seeds_for_milp = _seeds_for_r_required(r_required)
+    print(f"\nSeed budget: salvo_size={salvo_size}, n_interceptors_per_sat={n_interceptors_per_sat} "
+          f"→ r_required={r_required} → n_seeds_for_milp={n_seeds_for_milp}"
+          f"  (from SEEDS_FOR_MILP_BY_R_REQUIRED)")
 
     live_mask = [bool(v0.any()) for v0 in v0_list]
     n_dead    = live_mask.count(False)
@@ -651,7 +662,7 @@ def run_single(
         f"  Coverage proxy (all slots of selected seeds): "
         f"min={proxy_min:.1f}  mean={proxy_mean:.1f}  "
         f"requirement={r_required}  "
-        + ("✓ feasible" if feasible_proxy else "⚠ may be infeasible — consider raising SEEDS_FOR_MILP_BY_SALVO")
+        + ("✓ feasible" if feasible_proxy else "⚠ may be infeasible — consider raising SEEDS_FOR_MILP_BY_R_REQUIRED")
     )
 
     # Tag seeds by selection phase: polar-reserved, inc-guaranteed, or greedy fill.
