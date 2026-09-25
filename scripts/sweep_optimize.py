@@ -67,7 +67,13 @@ TARGET_SHELL_N_POINTS: int                        = 15000
 # period.  The actual simulation timestep is snapped to T_r/L after the RGT orbit
 # is selected, so DT_S itself is never used directly as a timestep.
 DT_S: float                                       = 120.0
-T_WINDOW_S: float                                 = 170.0
+# Old T_WINDOW_S (time from target launch to intercept, assumed == interceptor
+# flyout time) split into three inputs -- see CoverageConfig's docstring.
+# Defaults (0, 0) leave TARGET_MISSILE_BURNOUT_TIME_S == the old T_WINDOW_S
+# value, unchanged.
+DETECTION_TIME_S: float                           = 0.0
+DECISION_TIME_S: float                            = 0.0
+TARGET_MISSILE_BURNOUT_TIME_S: float              = 170.0
 A_G: float                                        = 10.0
 INTERCEPT_ALT_KM: float                           = 200.0
 MIN_ELEV_DEG: float                               = 0.0
@@ -410,7 +416,12 @@ def _result_subdir_for(
     path = (
         RESULTS_DIR / target_slug
         / f"burnout-vel-{v_bo_km_s:.1f}km-s"
-        / f"intercept-window-{T_WINDOW_S:.0f}s"
+        # Label kept as "intercept-window" (not renamed) so existing
+        # path-parsing regexes (cloud_plot_best_results.py,
+        # plot_best_results_by_country.py) keep matching -- only the source
+        # of the number changed, from T_WINDOW_S to
+        # TARGET_MISSILE_BURNOUT_TIME_S (numerically identical at defaults).
+        / f"intercept-window-{TARGET_MISSILE_BURNOUT_TIME_S:.0f}s"
         / f"intercept-alt-{INTERCEPT_ALT_KM:.0f}km"
         / f"max-accel-{A_G:.1f}g"
         / f"orbit-alt-{round(actual_alt_km)}km"
@@ -452,7 +463,9 @@ def run_single(
     # ------------------------------------------------------------------
     cov = CoverageConfig(
         earth=earth,
-        T_window_s=T_WINDOW_S,
+        detection_time_s=DETECTION_TIME_S,
+        decision_time_s=DECISION_TIME_S,
+        target_missile_burnout_time_s=TARGET_MISSILE_BURNOUT_TIME_S,
         v_bo_km_s=v_bo_km_s,
         a_g=A_G,
         intercept_alt_km=INTERCEPT_ALT_KM,
@@ -805,7 +818,10 @@ def run_single(
         # --- Engagement physics ---
         "dt_s":                           dt_s_actual,
         "dt_s_nominal":                   DT_S,
-        "t_window_s":                     T_WINDOW_S,
+        "detection_time_s":               DETECTION_TIME_S,
+        "decision_time_s":                DECISION_TIME_S,
+        "target_missile_burnout_time_s":  TARGET_MISSILE_BURNOUT_TIME_S,
+        "interceptor_engagement_time_s":  float(cov.interceptor_engagement_time_s),
         "v_bo_km_s":                      v_bo_km_s,
         "a_g":                            A_G,
         "intercept_alt_km":               INTERCEPT_ALT_KM,

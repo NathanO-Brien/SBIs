@@ -47,7 +47,13 @@ MIP_GAP:                    float = 0.001
 TIME_LIMIT_S:               float = 14400.0
 ALTITUDE_MAX_REPEAT_DAYS:   int   = 2
 DT_S:                       float = 120.0
-T_WINDOW_S:                 float = 170.0
+# Old T_WINDOW_S (time from target launch to intercept, assumed == interceptor
+# flyout time) split into three inputs -- see CoverageConfig's docstring for
+# the derivation. Defaults (0, 0) leave TARGET_MISSILE_BURNOUT_TIME_S == the
+# old T_WINDOW_S value, unchanged.
+DETECTION_TIME_S:           float = 0.0
+DECISION_TIME_S:            float = 0.0
+TARGET_MISSILE_BURNOUT_TIME_S: float = 170.0
 A_G:                        float = 10.0
 INTERCEPT_ALT_KM:           float = 200.0
 MIN_ELEV_DEG:               float = 0.0
@@ -144,7 +150,9 @@ def _config_for(
         "altitude_max_repeat_days":     ALTITUDE_MAX_REPEAT_DAYS,
         "seeds_for_milp_by_r_required": SEEDS_FOR_MILP_BY_R_REQUIRED,
         "dt_s":                         DT_S,
-        "t_window_s":                   T_WINDOW_S,
+        "detection_time_s":             DETECTION_TIME_S,
+        "decision_time_s":              DECISION_TIME_S,
+        "target_missile_burnout_time_s": TARGET_MISSILE_BURNOUT_TIME_S,
         "a_g":                          A_G,
         "intercept_alt_km":             INTERCEPT_ALT_KM,
         "min_elev_deg":                 MIN_ELEV_DEG,

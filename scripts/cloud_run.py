@@ -819,7 +819,13 @@ TARGET_POINTS: list[list] = [
 V_BO_KM_S:          float = 4.0
 SALVO_SIZE:         int   = 1
 N_INTERCEPTORS_PER_SAT: int = 1
-T_WINDOW_S:         float = 170.0
+# Old T_WINDOW_S (time from target launch to intercept, assumed == interceptor
+# flyout time) split into three inputs -- see CoverageConfig's docstring for
+# the derivation. Defaults (0, 0) leave TARGET_MISSILE_BURNOUT_TIME_S == the
+# old T_WINDOW_S value, unchanged.
+DETECTION_TIME_S:  float = 0.0
+DECISION_TIME_S:   float = 0.0
+TARGET_MISSILE_BURNOUT_TIME_S: float = 170.0
 A_G:                float = 10.0
 INTERCEPT_ALT_KM:   float = 200.0
 MIN_ELEV_DEG:       float = 0.0
@@ -889,7 +895,9 @@ def main() -> None:
     parser.add_argument("--salvo",        default=SALVO_SIZE,          type=int,   help=f"Salvo size (default: {SALVO_SIZE})")
     parser.add_argument("--interceptors", default=N_INTERCEPTORS_PER_SAT, type=int, help=f"Interceptors per satellite (default: {N_INTERCEPTORS_PER_SAT})")
     parser.add_argument("--vbo",          default=V_BO_KM_S,           type=float, help=f"Burnout velocity in km/s (default: {V_BO_KM_S})")
-    parser.add_argument("--t-window",     default=T_WINDOW_S,          type=float, help=f"Intercept time window in s (default: {T_WINDOW_S})")
+    parser.add_argument("--detection-time", default=DETECTION_TIME_S,  type=float, help=f"Time from target launch to detection, s (default: {DETECTION_TIME_S})")
+    parser.add_argument("--decision-time",  default=DECISION_TIME_S,   type=float, help=f"Time from detection to engage decision, s (default: {DECISION_TIME_S})")
+    parser.add_argument("--burnout-time",   default=TARGET_MISSILE_BURNOUT_TIME_S, type=float, help=f"Time from target launch to target burnout, s (default: {TARGET_MISSILE_BURNOUT_TIME_S})")
     parser.add_argument("--a-g",          default=A_G,                 type=float, help=f"Max accel in g (default: {A_G})")
     parser.add_argument("--intercept-alt", default=INTERCEPT_ALT_KM,  type=float, help=f"Intercept altitude in km (default: {INTERCEPT_ALT_KM})")
     parser.add_argument("--min-elev",     default=MIN_ELEV_DEG,        type=float, help=f"Min elevation angle in deg (default: {MIN_ELEV_DEG})")
@@ -979,7 +987,9 @@ def main() -> None:
         "v_bo_km_s":                    args.vbo,
         "salvo_size":                   args.salvo,
         "n_interceptors_per_sat":       args.interceptors,
-        "t_window_s":                   args.t_window,
+        "detection_time_s":             args.detection_time,
+        "decision_time_s":              args.decision_time,
+        "target_missile_burnout_time_s": args.burnout_time,
         "a_g":                          args.a_g,
         "intercept_alt_km":             args.intercept_alt,
         "min_elev_deg":                 args.min_elev,

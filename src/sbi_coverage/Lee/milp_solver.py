@@ -548,7 +548,10 @@ def save_sclp_result(
         "propagator": propagator,
         "bc_kg_m2": float(bc_kg_m2),
         "cov": {
-            "T_window_s":       float(cov.T_window_s),
+            "detection_time_s":               float(cov.detection_time_s),
+            "decision_time_s":                float(cov.decision_time_s),
+            "target_missile_burnout_time_s":  float(cov.target_missile_burnout_time_s),
+            "interceptor_engagement_time_s":  float(cov.interceptor_engagement_time_s),
             "v_bo_km_s":        float(cov.v_bo_km_s),
             "a_g":              float(cov.a_g),
             "intercept_alt_km": float(cov.intercept_alt_km),

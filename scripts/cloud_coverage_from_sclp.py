@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 
 import boto3
 
-from sbi_coverage.core.config import EarthConstants, SimConfig, CoverageConfig
+from sbi_coverage.core.config import EarthConstants, SimConfig, CoverageConfig, coverage_config_from_sidecar
 from sbi_coverage.core.elements import OrbitalElements, SatellitePhysical
 from sbi_coverage.core.shell import Shell
 from sbi_coverage.core.simulate import run_simulation
@@ -223,15 +223,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     earth = EarthConstants()
 
-    c = cfg["cov"]
-    cov = CoverageConfig(
-        earth=earth,
-        T_window_s=       float(c["T_window_s"]),
-        v_bo_km_s=        float(c["v_bo_km_s"]),
-        a_g=              float(c["a_g"]),
-        intercept_alt_km= float(c["intercept_alt_km"]),
-        min_elev_deg=     float(c["min_elev_deg"]),
-    )
+    cov = coverage_config_from_sidecar(cfg["cov"], earth)
 
     s = cfg["sim"]
     sim = SimConfig(

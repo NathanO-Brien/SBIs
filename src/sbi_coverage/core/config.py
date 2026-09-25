@@ -21,15 +21,29 @@ class EarthConstants:
 class CoverageConfig:
     """Engagement parameters and derived interceptor reach.
 
+    Timing model: the target missile burns out `target_missile_burnout_time_s`
+    after launch, and the intercept must happen before then. Of that budget,
+    `detection_time_s` is consumed before the launch is even detected and
+    `decision_time_s` before the decision to engage is made -- neither is
+    available to the interceptor's own flight. What's left,
+    `interceptor_engagement_time_s = target_missile_burnout_time_s -
+    detection_time_s - decision_time_s`, is the ONLY one of the four that
+    feeds the flyout-range physics. Modeling zero detection/decision time
+    (the default) makes interceptor_engagement_time_s equal to
+    target_missile_burnout_time_s -- i.e. the interceptor is assumed to
+    launch the instant the target does.
+
     The key derived value is `max_range_km`: the maximum straight-line
-    distance an interceptor can travel within the engagement window,
+    distance an interceptor can travel within interceptor_engagement_time_s,
     computed from the accelerate-then-coast performance model in
     engagement.interceptor_range_km() unless explicitly overridden.
     """
 
     # Engagement / sizing inputs
     earth: EarthConstants
-    T_window_s: float          # engagement time window, s
+    detection_time_s: float             # time from target launch to detection, s
+    decision_time_s: float              # time from detection to engage decision, s
+    target_missile_burnout_time_s: float  # time from target launch to target burnout, s
     v_bo_km_s: float           # interceptor burnout velocity, km/s
     a_g: float                 # interceptor acceleration, g's
     intercept_alt_km: float    # intercept altitude above Earth surface, km
@@ -40,23 +54,40 @@ class CoverageConfig:
     # Optional override of the derived reach (for experiments)
     max_range_km_override: Optional[float] = None
 
-    # Derived interceptor reach (computed in __post_init__)
+    # Derived timing and interceptor reach (computed in __post_init__)
+    interceptor_engagement_time_s: float = field(init=False)
     max_range_km: float = field(init=False)
 
     def __post_init__(self):
-        if self.T_window_s <= 0.0:
-            raise ValueError("CoverageConfig: T_window_s must be > 0")
+        if self.detection_time_s < 0.0:
+            raise ValueError("CoverageConfig: detection_time_s must be >= 0")
+        if self.decision_time_s < 0.0:
+            raise ValueError("CoverageConfig: decision_time_s must be >= 0")
+        if self.target_missile_burnout_time_s <= 0.0:
+            raise ValueError("CoverageConfig: target_missile_burnout_time_s must be > 0")
         if self.v_bo_km_s <= 0.0:
             raise ValueError("CoverageConfig: v_bo_km_s must be > 0")
         if self.a_g <= 0.0:
             raise ValueError("CoverageConfig: a_g must be > 0")
+
+        engagement_time = (
+            self.target_missile_burnout_time_s - self.detection_time_s - self.decision_time_s
+        )
+        if engagement_time <= 0.0:
+            raise ValueError(
+                "CoverageConfig: detection_time_s + decision_time_s "
+                f"({self.detection_time_s + self.decision_time_s:.3f} s) must be less than "
+                f"target_missile_burnout_time_s ({self.target_missile_burnout_time_s:.3f} s) -- "
+                "no time left for interceptor engagement"
+            )
+        object.__setattr__(self, "interceptor_engagement_time_s", engagement_time)
 
         if self.max_range_km_override is not None:
             max_range = float(self.max_range_km_override)
         else:
             max_range = float(
                 interceptor_range_km(
-                    T_s=float(self.T_window_s),
+                    T_s=float(engagement_time),
                     v_km_s=float(self.v_bo_km_s),
                     a_g=float(self.a_g),
                     g0_m_s2=float(getattr(self.earth, "g0_m_s2", 9.80665)),
@@ -64,6 +95,42 @@ class CoverageConfig:
             )
 
         object.__setattr__(self, "max_range_km", max_range)
+
+
+def coverage_config_from_sidecar(c: dict, earth: EarthConstants, **overrides) -> "CoverageConfig":
+    """Reconstruct a CoverageConfig from a saved result JSON's "cov" block.
+
+    Supports both schemas: a current sidecar (detection_time_s/decision_time_s/
+    target_missile_burnout_time_s) is used directly. A legacy sidecar (only
+    "T_window_s", from before the detection/decision timing split) is read as
+    detection_time_s=0, decision_time_s=0, target_missile_burnout_time_s=
+    T_window_s -- exactly the old behavior, where the whole window was
+    dedicated to interceptor flyout.
+
+    overrides are passed through to CoverageConfig(...), taking precedence
+    over the sidecar's own values (e.g. min_elev_deg, max_range_km_override).
+    """
+    if "target_missile_burnout_time_s" in c:
+        detection_time_s = float(c["detection_time_s"])
+        decision_time_s = float(c["decision_time_s"])
+        target_missile_burnout_time_s = float(c["target_missile_burnout_time_s"])
+    else:
+        detection_time_s = 0.0
+        decision_time_s = 0.0
+        target_missile_burnout_time_s = float(c["T_window_s"])
+
+    kwargs = dict(
+        earth=earth,
+        detection_time_s=detection_time_s,
+        decision_time_s=decision_time_s,
+        target_missile_burnout_time_s=target_missile_burnout_time_s,
+        v_bo_km_s=float(c["v_bo_km_s"]),
+        a_g=float(c["a_g"]),
+        intercept_alt_km=float(c["intercept_alt_km"]),
+        min_elev_deg=float(c["min_elev_deg"]),
+    )
+    kwargs.update(overrides)
+    return CoverageConfig(**kwargs)
 
 
 @dataclass

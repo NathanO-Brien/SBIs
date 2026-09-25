@@ -76,7 +76,6 @@ from sbi_coverage.Lee import (
 # These are not exposed in the config file.
 # ---------------------------------------------------------------------------
 _DT_S: float                    = 120.0
-_T_WINDOW_S: float              = 170.0
 _A_G: float                     = 10.0
 _INTERCEPT_ALT_KM: float        = 200.0
 _MIN_ELEV_DEG: float            = 0.0
@@ -151,7 +150,13 @@ _CONFIG_DEFAULTS: dict = {
     "seeds_for_milp_by_r_required": {1: 25, 5: 25, 20: 50, 50: 100, 100: 150},
     # Simulation parameters
     "dt_s":                         120.0,
-    "t_window_s":                   170.0,
+    # Old "t_window_s" (time from target launch to intercept, assumed ==
+    # interceptor flyout time) split into three inputs -- see CoverageConfig's
+    # docstring for the derivation. Defaults (0, 0) leave
+    # target_missile_burnout_time_s == the old t_window_s value, unchanged.
+    "detection_time_s":             0.0,
+    "decision_time_s":              0.0,
+    "target_missile_burnout_time_s": 170.0,
     "a_g":                          10.0,
     "intercept_alt_km":             200.0,
     "min_elev_deg":                 0.0,
@@ -217,7 +222,12 @@ def _build_s3_prefix(cfg: dict, actual_alt_km: float, n_targets: int) -> str:
     intercept_alt = round(float(cfg["intercept_alt_km"]))
     orbit_alt     = round(float(actual_alt_km))
     vbo           = cfg["v_bo_km_s"]
-    t_window      = round(float(cfg["t_window_s"]))
+    # "t_window" name and the "intercept-window" label below are kept (not
+    # renamed to burnout_time/burnout-time) so existing path-parsing regexes
+    # (cloud_plot_best_results.py, plot_best_results_by_country.py) keep
+    # matching -- only the source of the number changed, from t_window_s to
+    # target_missile_burnout_time_s (numerically identical at defaults).
+    t_window      = round(float(cfg["target_missile_burnout_time_s"]))
     a_g           = float(cfg["a_g"])
     ips           = int(cfg["n_interceptors_per_sat"])
     doctrine      = 1   # multiplier on r_required; always 1 for now
@@ -357,7 +367,9 @@ def _load_config(s3_uri: str) -> dict:
         int(cfg["n_seeds_for_milp"]) if cfg.get("n_seeds_for_milp") is not None else None
     )
     cfg["dt_s"]                         = float(cfg["dt_s"])
-    cfg["t_window_s"]                   = float(cfg["t_window_s"])
+    cfg["detection_time_s"]             = float(cfg["detection_time_s"])
+    cfg["decision_time_s"]              = float(cfg["decision_time_s"])
+    cfg["target_missile_burnout_time_s"] = float(cfg["target_missile_burnout_time_s"])
     cfg["a_g"]                          = float(cfg["a_g"])
     cfg["intercept_alt_km"]             = float(cfg["intercept_alt_km"])
     cfg["min_elev_deg"]                 = float(cfg["min_elev_deg"])
@@ -559,11 +571,19 @@ def main() -> None:
 
     cov = CoverageConfig(
         earth=earth,
-        T_window_s=cfg["t_window_s"],
+        detection_time_s=cfg["detection_time_s"],
+        decision_time_s=cfg["decision_time_s"],
+        target_missile_burnout_time_s=cfg["target_missile_burnout_time_s"],
         v_bo_km_s=cfg["v_bo_km_s"],
         a_g=cfg["a_g"],
         intercept_alt_km=cfg["intercept_alt_km"],
         min_elev_deg=cfg["min_elev_deg"],
+    )
+    print(
+        f"Interceptor engagement time: {cov.interceptor_engagement_time_s:.2f} s "
+        f"(burnout {cfg['target_missile_burnout_time_s']:.0f}s - detection {cfg['detection_time_s']:.0f}s "
+        f"- decision {cfg['decision_time_s']:.0f}s)",
+        flush=True,
     )
     print(f"\nComputed R_max: {cov.max_range_km:.2f} km", flush=True)
 
@@ -940,7 +960,10 @@ def main() -> None:
         "n_targets":                      int(n_targets),
         # --- Engagement physics ---
         "dt_s":                           cfg["dt_s"],
-        "t_window_s":                     cfg["t_window_s"],
+        "detection_time_s":               cfg["detection_time_s"],
+        "decision_time_s":                cfg["decision_time_s"],
+        "target_missile_burnout_time_s":  cfg["target_missile_burnout_time_s"],
+        "interceptor_engagement_time_s":  float(cov.interceptor_engagement_time_s),
         "v_bo_km_s":                      cfg["v_bo_km_s"],
         "a_g":                            cfg["a_g"],
         "intercept_alt_km":               cfg["intercept_alt_km"],
