@@ -16,14 +16,14 @@ Environment variables (the only three needed):
     S3_PREFIX   S3 key prefix for this job's outputs, e.g. "results/run-001"
                 (no trailing slash).
 
-Config file schema (JSON):
+Config file schema (JSON) -- required/most-relevant keys shown; see
+_CONFIG_DEFAULTS below for the full set:
     {
         "job_name":                     "china_450km",   // optional; auto-timestamped if omitted
-        "target_country":               "China",         // required
-        "target_shell_n_points":        10000,           // optional, default 10000
-        "altitude_override_km":         450.0,           // optional; null uses geometric h*
+        "target_country":               "China",         // required in country mode
+        "target_shell_n_points":        10000,           // optional, default 10000 (country mode)
+        "target_altitude_km":           450.0,           // required
         "inclination_sweep_bounds_deg": [20.0, 90.0],   // optional, default [20, 90]
-        "use_j2":                       false,           // optional, default false (Keplerian)
         "v_bo_km_s":                    6.0,             // required
         "salvo_size":                   1,               // required
         "n_interceptors_per_sat":       1,               // required
@@ -60,8 +60,6 @@ from sbi_coverage.Lee import (
     build_orb_elems_table,
     build_param_V,
     candidate_rgt_ratios,
-    footprint_half_angles_deg,
-    optimal_sat_altitude_km,
     param_V_summary,
     print_orb_table,
     rgt_common_ground_track_layer,
@@ -72,55 +70,9 @@ from sbi_coverage.Lee import (
 
 
 # ---------------------------------------------------------------------------
-# Fixed algorithm parameters — mirror lee_test2.py exactly.
-# These are not exposed in the config file.
+# Fixed algorithm parameters not exposed in the config file.
 # ---------------------------------------------------------------------------
-_DT_S: float                    = 120.0
-_A_G: float                     = 10.0
-_INTERCEPT_ALT_KM: float        = 200.0
-_MIN_ELEV_DEG: float            = 0.0
-_INC_SCREEN_STEP_DEG: float     = 1.0
-_ALTITUDE_MAX_REPEAT_DAYS: int  = 1
-_N_RAAN_OFFSETS: int            = 10
-_SEED_WORKERS: int              = 8
-# Keyed on r_required = ceil(salvo_size / n_interceptors_per_sat), not on
-# salvo_size directly — the greedy pool must be large enough for the
-# solver to find r_required satellites simultaneously in view of every
-# target, and that's the quantity that actually drives feasibility/
-# difficulty, not salvo_size alone. See the "Two-Stage Hybrid" discussion
-# in docs/paper/sbi_optimization_paper.tex for the reasoning.
-_SEEDS_FOR_MILP_BY_R_REQUIRED: dict[int, int] = {
-    1:   25,
-    5:   25,
-    20:  50,
-    50: 100,
-    100: 150,
-}
-_RESERVE_POLAR_ORBITS: bool     = False
-_USE_J2: bool                   = False
-_MIP_FOCUS: int                 = 1
-_HEURISTICS_FRAC: float         = 0.2
-_SOLVER_PARAMS: dict = {
-    # Method 1 = dual simplex. Previously Method 2 (Barrier) — barrier took 300s+ on root LP
-    # and crossover added another 70s. For pure 0/1 set-cover with an all-ones matrix,
-    # dual simplex is faster because the matrix is sparse and simplex exploits that.
-    "Method":                1,
-    # Write B&B nodes to disk at 4 GB — prevents OOM during branching.
-    "NodefileStart":         4,
-    # RINS heuristic every 50 nodes — this is what actually finds good solutions.
-    # B&B alone cannot explore enough nodes on problems of this size.
-    "RINS":                  50,
-    # Presolve removed 0 rows and 0 columns in testing (pure 0/1 set-cover gives it
-    # nothing to exploit) while consuming 268s. Disabled.
-    # Previously: "Presolve": 2
-    # No-improvement termination: stop if no incumbent improvement for 1 hour,
-    # but don't start that clock until 3 hours in — gives RINS time to find its
-    # first solution on hard instances before the termination check activates.
-    # Previously used a fixed TimeLimit only, which wasted hours on a stalled solver.
-}
 _PROPAGATOR: str                = "Nominal_Propagator"
-
-_POLAR_RESERVATION_INCLINATIONS: tuple[float, ...] = (80.0, 85.0, 90.0)
 
 
 # ---------------------------------------------------------------------------
@@ -129,14 +81,16 @@ _POLAR_RESERVATION_INCLINATIONS: tuple[float, ...] = (80.0, 85.0, 90.0)
 
 _CONFIG_DEFAULTS: dict = {
     "job_name":                     None,    # auto-generated if omitted
+    # Run metadata -- saved into run_config only, no other effect
+    "run_name":                     None,
+    "is_principal_set":             False,
     # Target — exactly one of target_country or target_points must be set
     "target_mode":                  "country",   # "country" or "prespecified"
     "target_country":               None,
     "target_points":                None,        # list of [name, lat, lon] for prespecified mode
     "target_shell_n_points":        15000,
-    "altitude_override_km":         None,    # null → use geometric h*
+    "target_altitude_km":           None,    # required
     "inclination_sweep_bounds_deg": [20.0, 90.0],
-    "use_j2":                       False,
     "v_bo_km_s":                    None,    # required
     "salvo_size":                   None,    # required
     "n_interceptors_per_sat":       None,    # required
@@ -163,20 +117,16 @@ _CONFIG_DEFAULTS: dict = {
     "inc_screen_step_deg":          1.0,
     "n_raan_offsets":               10,
     "seed_workers":                 8,
-    "reserve_polar_orbits":         False,
-    # Solver tuning
-    "mip_focus":                    1,
-    "heuristics_frac":              0.2,
-    "solver_params":                {
-        "Method":                1,
-        "NodefileStart":         4,
-        "RINS":                  50,
-        "ImproveStartTime":      10800,
-        "NoImproveLimit":        3600,
-    },
+    # Solver tuning -- intentionally neutral (Gurobi's own defaults) unless a
+    # config explicitly overrides one of these; the schema still accepts
+    # overrides if per-run tuning is worth reintroducing later.
+    "mip_focus":                    0,
+    "heuristics_frac":              0.05,
+    "solver_params":                None,
 }
 
 _REQUIRED_CONFIG_KEYS = {
+    "target_altitude_km",
     "v_bo_km_s",
     "salvo_size",
     "n_interceptors_per_sat",
@@ -194,8 +144,8 @@ def _build_s3_prefix(cfg: dict, actual_alt_km: float, n_targets: int) -> str:
     Structure:
         <target-mode>/<target-name>/target-points-<N>/
         intercept-alt-<X>km/orbit-alt-<X>km/burnout-vel-<X>km-s/
-        intercept-window-<X>s/max-accel-<X>g/
-        interceptors-per-sat-<X>/doctrine-<X>x/salvo-size-<X>
+        intercept-window-<X>s/detection-time-<X>s/decision-time-<X>s/
+        max-accel-<X>g/interceptors-per-sat-<X>/doctrine-<X>x/salvo-size-<X>
     """
     # --- target mode and name ---
     mode = str(cfg.get("target_mode", "country")).strip().lower()
@@ -228,6 +178,8 @@ def _build_s3_prefix(cfg: dict, actual_alt_km: float, n_targets: int) -> str:
     # matching -- only the source of the number changed, from t_window_s to
     # target_missile_burnout_time_s (numerically identical at defaults).
     t_window      = round(float(cfg["target_missile_burnout_time_s"]))
+    detect_time   = round(float(cfg["detection_time_s"]))
+    decide_time   = round(float(cfg["decision_time_s"]))
     a_g           = float(cfg["a_g"])
     ips           = int(cfg["n_interceptors_per_sat"])
     doctrine      = 1   # multiplier on r_required; always 1 for now
@@ -241,6 +193,8 @@ def _build_s3_prefix(cfg: dict, actual_alt_km: float, n_targets: int) -> str:
         f"orbit-alt-{orbit_alt}km",
         f"burnout-vel-{vbo:.1f}km-s",
         f"intercept-window-{t_window}s",
+        f"detection-time-{detect_time}s",
+        f"decision-time-{decide_time}s",
         f"max-accel-{a_g:.1f}g",
         f"interceptors-per-sat-{ips}",
         f"doctrine-{doctrine}x",
@@ -354,10 +308,10 @@ def _load_config(s3_uri: str) -> dict:
     cfg["n_interceptors_per_sat"]       = int(cfg["n_interceptors_per_sat"])
     cfg["v_bo_km_s"]                    = float(cfg["v_bo_km_s"])
     cfg["target_shell_n_points"]        = int(cfg["target_shell_n_points"])
-    cfg["target_country"]               = str(cfg["target_country"]).strip()
-    cfg["altitude_override_km"]         = (
-        float(cfg["altitude_override_km"]) if cfg["altitude_override_km"] is not None else None
+    cfg["target_country"]               = (
+        str(cfg["target_country"]).strip() if cfg.get("target_country") is not None else None
     )
+    cfg["target_altitude_km"]           = float(cfg["target_altitude_km"])
     cfg["inclination_sweep_bounds_deg"] = [
         float(x) for x in cfg["inclination_sweep_bounds_deg"]
     ]
@@ -376,10 +330,13 @@ def _load_config(s3_uri: str) -> dict:
     cfg["inc_screen_step_deg"]          = float(cfg["inc_screen_step_deg"])
     cfg["n_raan_offsets"]               = int(cfg["n_raan_offsets"])
     cfg["seed_workers"]                 = int(cfg["seed_workers"])
-    cfg["reserve_polar_orbits"]         = bool(cfg["reserve_polar_orbits"])
     cfg["mip_focus"]                    = int(cfg["mip_focus"])
     cfg["heuristics_frac"]              = float(cfg["heuristics_frac"])
-    cfg["solver_params"]                = dict(cfg["solver_params"])
+    cfg["solver_params"]                = (
+        dict(cfg["solver_params"]) if cfg.get("solver_params") is not None else None
+    )
+    cfg["run_name"]                     = str(cfg["run_name"]) if cfg.get("run_name") is not None else None
+    cfg["is_principal_set"]             = bool(cfg.get("is_principal_set", False))
 
     return cfg
 
@@ -394,23 +351,18 @@ def _greedy_select_seeds(
     n_max: int,
     *,
     inc_deg_list: list[float] | None = None,
-    reserve_polar_orbits: bool = False,
 ) -> list[int]:
     """Greedy marginal-coverage seed selection (mirrors lee_test2.py exactly).
 
-    Three-phase selection:
-
-    Phase 0 — Polar reservation (if reserve_polar_orbits is True):
-        Pre-select the best-RAAN seed for each inclination in
-        _POLAR_RESERVATION_INCLINATIONS before any other selection runs.
+    Two-phase selection:
 
     Phase 1 — Inclination guarantee:
-        Every discrete inclination value present in inc_deg_list that was not
-        already covered by Phase 0 is guaranteed exactly one representative.
-        Among all RAAN candidates for a given inclination the one with the
-        highest marginal-coverage score is chosen.  Inclinations are processed
-        in greedy order — whichever missing inclination's best candidate
-        contributes the most marginal coverage is selected first.
+        Every discrete inclination value present in inc_deg_list is
+        guaranteed exactly one representative. Among all RAAN candidates for
+        a given inclination the one with the highest marginal-coverage score
+        is chosen.  Inclinations are processed in greedy order — whichever
+        missing inclination's best candidate contributes the most marginal
+        coverage is selected first.
 
     Phase 2 — Greedy fill:
         Remaining n_max slots are filled by standard greedy marginal-coverage,
@@ -421,24 +373,6 @@ def _greedy_select_seeds(
     deficit   = np.full(access.shape[1], float(r_required))
     selected: list[int] = []
     remaining = list(range(n_seeds))
-
-    # ------------------------------------------------------------------
-    # Phase 0: Polar reservation
-    # ------------------------------------------------------------------
-    if reserve_polar_orbits and inc_deg_list is not None and n_max >= 1:
-        for target_inc in _POLAR_RESERVATION_INCLINATIONS:
-            if len(selected) >= n_max:
-                break
-            candidates = [
-                i for i in remaining
-                if abs(inc_deg_list[i] - target_inc) < 0.1
-            ]
-            if not candidates:
-                continue
-            best = max(candidates, key=lambda i: access[i].sum())
-            selected.append(best)
-            deficit = np.maximum(0.0, deficit - access[best])
-            remaining.remove(best)
 
     # ------------------------------------------------------------------
     # Phase 1: Inclination guarantee — every unique inclination gets one rep
@@ -553,8 +487,7 @@ def main() -> None:
     print(f"  Config source  : {s3_config_uri}",                                 flush=True)
     print(f"  Target         : {_target_desc}",                                  flush=True)
     print(f"  Inc bounds     : [{inc_lo:.1f}°, {inc_hi:.1f}°]",                 flush=True)
-    print(f"  Altitude       : {cfg['altitude_override_km']} km override"
-          f"  (None → geometric h*)",                                            flush=True)
+    print(f"  Altitude       : {cfg['target_altitude_km']} km",                   flush=True)
     print(f"  v_bo           : {cfg['v_bo_km_s']} km/s",                        flush=True)
     print(f"  Salvo size     : {cfg['salvo_size']}",                             flush=True)
     print(f"  Interceptors   : {cfg['n_interceptors_per_sat']} per sat",         flush=True)
@@ -587,37 +520,18 @@ def main() -> None:
     )
     print(f"\nComputed R_max: {cov.max_range_km:.2f} km", flush=True)
 
-    h_star = optimal_sat_altitude_km(
-        max_range_km=cov.max_range_km,
-        min_elev_deg=cov.min_elev_deg,
-        intercept_alt_km=cov.intercept_alt_km,
-        earth=earth,
-    )
-    angles = footprint_half_angles_deg(
-        h_sat_km=h_star,
-        max_range_km=cov.max_range_km,
-        min_elev_deg=cov.min_elev_deg,
-        intercept_alt_km=cov.intercept_alt_km,
-        earth=earth,
-    )
-    print(f"Optimal satellite altitude (h*): {h_star:.2f} km",                  flush=True)
-    print(f"  rho_eff: {angles['rho_eff_deg']:.4f} deg"
-          f"  (binding: {angles['binding']})",                                   flush=True)
-
     # ------------------------------------------------------------------
     # RGT orbit selection
     # ------------------------------------------------------------------
-    altitude_ref = cfg["altitude_override_km"] if cfg["altitude_override_km"] is not None else h_star
-
     candidates = candidate_rgt_ratios(
-        h_star_km=altitude_ref,
+        h_star_km=cfg["target_altitude_km"],
         earth=earth,
         max_repeat_days=cfg["altitude_max_repeat_days"],
         dt_s=cfg["dt_s"],
     )
     if not candidates:
         print(
-            f"[batch_worker] ERROR: No RGT orbit found near {altitude_ref:.0f} km "
+            f"[batch_worker] ERROR: No RGT orbit found near {cfg['target_altitude_km']:.0f} km "
             f"with N_D ≤ {cfg['altitude_max_repeat_days']}.",
             flush=True,
         )
@@ -629,45 +543,22 @@ def main() -> None:
     L             = int(best["L"])
     actual_alt_km = float(best["alt_km"])
 
-    use_j2 = bool(cfg.get("use_j2", False))
+    _dt_s_actual = float(best["T_r_s"]) / L
+    horizon_s    = (L - 1) * _dt_s_actual
 
-    if use_j2:
-        from sbi_coverage.Lee.rgt_slots import a_km_j2_rgt as _a_km_j2_rgt
-        _inc_ref     = 0.5 * (float(inc_lo) + float(inc_hi))
-        _a_j2        = _a_km_j2_rgt(N_P, N_D, _inc_ref, earth)
-        _n_j2        = float(np.sqrt(earth.mu_km3_s2 / _a_j2**3))
-        _fac_j2      = 1.5 * earth.j2 * (earth.r_eq_km / _a_j2)**2 * _n_j2
-        _od_j2       = 0.5 * _fac_j2 * (5.0 * np.cos(np.deg2rad(_inc_ref))**2 - 1.0)
-        _T_r_j2      = N_P * 2.0 * np.pi / (_n_j2 + _od_j2)
-        L            = round(_T_r_j2 / cfg["dt_s"])
-        _dt_s_actual = _T_r_j2 / L
-        _a_j2_ref    = _a_j2
-    else:
-        _dt_s_actual = float(best["T_r_s"]) / L
-        _a_j2_ref    = None
-
-    horizon_s     = (L - 1) * _dt_s_actual
-
-    if cfg["altitude_override_km"] is not None:
-        print(
-            f"\nAltitude OVERRIDE: {cfg['altitude_override_km']:.1f} km  →  "
-            f"nearest RGT orbit: {N_P}:{N_D}  "
-            f"actual_alt={actual_alt_km:.2f} km  "
-            f"(snap error: {float(best['alt_error_km']):.2f} km)",
-            flush=True,
-        )
-    else:
-        print(
-            f"\nGeometric h*: {h_star:.2f} km  →  "
-            f"nearest RGT orbit: {N_P}:{N_D}  actual_alt={actual_alt_km:.2f} km",
-            flush=True,
-        )
+    print(
+        f"\nTarget altitude requested: {cfg['target_altitude_km']:.1f} km  →  "
+        f"nearest RGT orbit: {N_P}:{N_D}  "
+        f"actual_alt={actual_alt_km:.2f} km  "
+        f"(snap error: {float(best['alt_error_km']):.2f} km)",
+        flush=True,
+    )
 
     sim = SimConfig(
         horizon_s=horizon_s,
         dt_s=_dt_s_actual,
         analysis_matrix_dtype="uint8",
-        use_j2=use_j2,
+        use_j2=False,
         use_drag=False,
     )
     print(
@@ -729,10 +620,6 @@ def main() -> None:
         float(inc_hi) + float(cfg["inc_screen_step_deg"]) * 0.5,
         float(cfg["inc_screen_step_deg"]),
     )
-    if cfg["reserve_polar_orbits"]:
-        polar_extra = np.array(list(_POLAR_RESERVATION_INCLINATIONS), dtype=np.float64)
-        inc_grid    = np.unique(np.concatenate([inc_grid, polar_extra]))
-
     raan_interval = 360.0 / N_P
     raan_grid     = np.linspace(0.0, raan_interval, cfg["n_raan_offsets"], endpoint=False)
     seed_pairs    = [(float(inc), float(raan)) for inc in inc_grid for raan in raan_grid]
@@ -757,8 +644,6 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Build sub-layers
     # ------------------------------------------------------------------
-    _a_km_ref  = _a_j2_ref      if sim.use_j2 else None
-    _dt_s_slot = _dt_s_actual   if sim.use_j2 else None
     sub_layers = [
         rgt_common_ground_track_layer(
             inc_deg=inc,
@@ -767,9 +652,7 @@ def main() -> None:
             L=L,
             earth=earth,
             raan0_deg=raan,
-            use_j2=sim.use_j2,
-            a_km_override=_a_km_ref,
-            dt_s=_dt_s_slot,
+            use_j2=False,
         )
         for inc, raan in seed_pairs
     ]
@@ -832,7 +715,6 @@ def main() -> None:
     greedy_idx   = _greedy_select_seeds(
         v0_list, r_required, n_seeds_for_milp,
         inc_deg_list=inc_deg_list,
-        reserve_polar_orbits=cfg["reserve_polar_orbits"],
     )
     n_selected = len(greedy_idx)
     print(f"\nGreedy seed selection: {n_selected} of {n_seeds} live seeds → MILP", flush=True)
@@ -849,35 +731,18 @@ def main() -> None:
         flush=True,
     )
 
-    # Tag seeds by selection phase: polar-reserved, inc-guaranteed, or greedy fill.
-    polar_reserved_set: dict[int, float] = {}
-    if cfg["reserve_polar_orbits"] and inc_deg_list:
-        for idx in greedy_idx:
-            inc_val = inc_deg_list[idx]
-            for target_inc in _POLAR_RESERVATION_INCLINATIONS:
-                if abs(inc_val - target_inc) < 0.1 and target_inc not in polar_reserved_set.values():
-                    polar_reserved_set[idx] = target_inc
-                    break
-            if len(polar_reserved_set) >= len(_POLAR_RESERVATION_INCLINATIONS):
-                break
+    # Tag seeds by selection phase: inc-guaranteed, or greedy fill.
     inc_guaranteed_set: set[int] = set()
     if inc_deg_list:
-        _seen_incs: set[float] = {inc_deg_list[i] for i in polar_reserved_set}
+        _seen_incs: set[float] = set()
         for idx in greedy_idx:
-            if idx in polar_reserved_set:
-                continue
             _inc_val = inc_deg_list[idx]
             if _inc_val not in _seen_incs:
                 inc_guaranteed_set.add(idx)
                 _seen_incs.add(_inc_val)
     for rank, idx in enumerate(greedy_idx):
         inc, raan = seed_pairs[idx]
-        if idx in polar_reserved_set:
-            tag = f"  [polar reserved {polar_reserved_set[idx]:.0f}°]"
-        elif idx in inc_guaranteed_set:
-            tag = "  [inc. guaranteed]"
-        else:
-            tag = ""
+        tag = "  [inc. guaranteed]" if idx in inc_guaranteed_set else ""
         print(
             f"  {rank + 1:2d}: i={inc:5.1f}°  RAAN={raan:6.1f}°  "
             f"access/target={v0_list[idx].sum(axis=0).mean():.1f}{tag}",
@@ -952,9 +817,12 @@ def main() -> None:
     # Build run_config metadata block (mirrors lee_test2.py)
     # ------------------------------------------------------------------
     run_config = {
+        # --- Run metadata ---
+        "run_name":                       cfg["run_name"],
+        "is_principal_set":               cfg["is_principal_set"],
         # --- Target ---
         "target_mode":                    target_mode,
-        "target_country":                 country,
+        "target_country":                 country if target_mode == "country" else None,
         "target_points":                  [list(p) for p in target_points] if target_mode == "prespecified" else None,
         "target_shell_n_points":          cfg["target_shell_n_points"] if target_mode == "country" else None,
         "n_targets":                      int(n_targets),
@@ -970,9 +838,8 @@ def main() -> None:
         "min_elev_deg":                   cfg["min_elev_deg"],
         "r_max_km":                       float(cov.max_range_km),
         # --- Orbit ---
-        "altitude_override_km":           cfg["altitude_override_km"],
+        "target_altitude_km":             cfg["target_altitude_km"],
         "altitude_max_repeat_days":       cfg["altitude_max_repeat_days"],
-        "h_star_km":                      float(h_star),
         "actual_alt_km":                  float(actual_alt_km),
         "rgt_ratio":                      f"{N_P}:{N_D}",
         "L":                              int(L),
@@ -986,8 +853,6 @@ def main() -> None:
         "n_seeds_simulated":              int(n_seeds_total),
         "n_seeds_live":                   int(n_seeds_live),
         "n_seeds_for_milp":               n_seeds_for_milp,
-        "reserve_polar_orbits":           cfg["reserve_polar_orbits"],
-        "polar_reservation_inclinations": list(_POLAR_RESERVATION_INCLINATIONS) if cfg["reserve_polar_orbits"] else [],
         "seeds_selected": [
             {
                 "rank":     rank + 1,
