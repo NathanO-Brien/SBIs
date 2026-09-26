@@ -25,6 +25,8 @@ import json
 
 import boto3
 
+from sbi_coverage.core.target_points import load_target_points_csv, smart_inclination_bounds
+
 # ---------------------------------------------------------------------------
 # AWS / S3 configuration
 # ---------------------------------------------------------------------------
@@ -831,9 +833,8 @@ INTERCEPT_ALT_KM:   float = 200.0
 MIN_ELEV_DEG:       float = 0.0
 
 # Orbit
-ALTITUDE_OVERRIDE_KM:     float | None = 400.0   # None â†’ use geometric h*
-ALTITUDE_MAX_REPEAT_DAYS: int          = 2
-USE_J2:                   bool         = False
+TARGET_ALTITUDE_KM:       float = 400.0  # required; snapped to the nearest RGT orbit
+ALTITUDE_MAX_REPEAT_DAYS: int   = 2
 
 # Seed grid
 DT_S:               float = 120.0
@@ -841,31 +842,20 @@ INC_SCREEN_STEP_DEG: float = 1.0
 N_RAAN_OFFSETS:     int   = 10
 SEED_WORKERS:       int   = 8
 N_SEEDS_FOR_MILP:   int   = 25
-RESERVE_POLAR_ORBITS: bool = False
 
 # Solver
 MIP_GAP:        float = 0.01
 TIME_LIMIT_S:   float = 14400.0
-MIP_FOCUS:      int   = 1
-HEURISTICS_FRAC: float = 0.2
-SOLVER_PARAMS:  dict  = {
-    # Method 1 = dual simplex. Previously Method 2 (Barrier) â€” barrier took 300s+ on root LP
-    # and crossover added another 70s. For pure 0/1 set-cover with an all-ones matrix,
-    # dual simplex is faster because the matrix is sparse and simplex exploits that.
-    "Method":                1,
-    # Write B&B nodes to disk at 4 GB â€” prevents OOM during branching.
-    "NodefileStart":         4,
-    # RINS heuristic every 50 nodes â€” this is what actually finds good solutions.
-    # B&B alone cannot explore enough nodes on problems of this size.
-    "RINS":                  50,
-    # Presolve removed 0 rows and 0 columns in testing (pure 0/1 set-cover gives it
-    # nothing to exploit) while consuming 268s. Disabled.
-    # Previously: "Presolve": 2
-    # No-improvement termination: stop if no incumbent improvement for 1 hour,
-    # but don't start that clock until 3 hours in â€” gives RINS time to find its
-    # first solution on hard instances before the termination check activates.
-    # Previously used a fixed TimeLimit only, which wasted hours on a stalled solver.
-}
+# mip_focus/heuristics_frac/solver_params are intentionally not exposed here
+# -- batch_worker.py's config schema now defaults to vanilla Gurobi tuning
+# (MIPFocus=0, Heuristics=0.05, no solver_params overrides) when these keys
+# are absent from the uploaded config, which is what omitting them here
+# achieves. The schema itself still accepts them; re-add the CLI flags and
+# cfg keys below if per-run tuning is worth reintroducing.
+
+# Run metadata (optional; saved into the output JSON only)
+RUN_NAME: str | None = None
+IS_PRINCIPAL_SET: bool = False
 
 
 def main() -> None:
@@ -889,9 +879,19 @@ def main() -> None:
             "(e.g. \"NK: Yongbyon,39.79,125.66\"). Sets prespecified mode."
         ),
     )
+    target_group.add_argument(
+        "--target-points-csv",
+        metavar="PATH",
+        help=(
+            "Path to a CSV file of prespecified target points (header row "
+            "with some case-insensitive variant of Location/Lat/Lon -- see "
+            "sbi_coverage.core.target_points.load_target_points_csv). "
+            "Sets prespecified mode."
+        ),
+    )
 
     # Engagement
-    parser.add_argument("--altitude",     required=True,  type=float, help="Orbit altitude override in km (required)")
+    parser.add_argument("--target-altitude", required=True, type=float, help="Target orbit altitude in km (required); snapped to the nearest RGT orbit")
     parser.add_argument("--salvo",        default=SALVO_SIZE,          type=int,   help=f"Salvo size (default: {SALVO_SIZE})")
     parser.add_argument("--interceptors", default=N_INTERCEPTORS_PER_SAT, type=int, help=f"Interceptors per satellite (default: {N_INTERCEPTORS_PER_SAT})")
     parser.add_argument("--vbo",          default=V_BO_KM_S,           type=float, help=f"Burnout velocity in km/s (default: {V_BO_KM_S})")
@@ -904,9 +904,8 @@ def main() -> None:
 
     # Orbit
     parser.add_argument("--altitude-max-repeat-days", default=ALTITUDE_MAX_REPEAT_DAYS, type=int,   help=f"Max RGT repeat days (default: {ALTITUDE_MAX_REPEAT_DAYS})")
-    parser.add_argument("--use-j2",       action="store_true", default=USE_J2,  help="Enable J2 perturbation model")
     parser.add_argument("--inc-bounds",   default=None, nargs=2, type=float, metavar=("LO", "HI"),
-                        help="Inclination sweep bounds in deg (default: per-country or 20 90)")
+                        help="Inclination sweep bounds in deg (default: per-country, or geometry-aware for prespecified)")
 
     # Seed grid
     parser.add_argument("--dt",           default=DT_S,                type=float, help=f"Time step in s (default: {DT_S})")
@@ -914,14 +913,15 @@ def main() -> None:
     parser.add_argument("--n-raan",       default=N_RAAN_OFFSETS,      type=int,   help=f"RAAN offsets per inclination (default: {N_RAAN_OFFSETS})")
     parser.add_argument("--seed-workers", default=SEED_WORKERS,        type=int,   help=f"Parallel seed workers (default: {SEED_WORKERS})")
     parser.add_argument("--n-seeds",      default=N_SEEDS_FOR_MILP,    type=int,   help=f"Seeds passed to MILP (default: {N_SEEDS_FOR_MILP})")
-    parser.add_argument("--reserve-polar", action="store_true", default=RESERVE_POLAR_ORBITS, help="Reserve polar orbit seeds")
     parser.add_argument("--n-points",     default=TARGET_SHELL_N_POINTS, type=int, help=f"Target shell points (country mode, default: {TARGET_SHELL_N_POINTS})")
 
     # Solver
     parser.add_argument("--mip-gap",      default=MIP_GAP,        type=float, help=f"MIP gap target (default: {MIP_GAP})")
     parser.add_argument("--time-limit",   default=TIME_LIMIT_S,   type=float, help=f"Solver time limit in s (default: {TIME_LIMIT_S})")
-    parser.add_argument("--mip-focus",    default=MIP_FOCUS,       type=int,   help=f"Gurobi MIPFocus (default: {MIP_FOCUS})")
-    parser.add_argument("--heuristics",   default=HEURISTICS_FRAC, type=float, help=f"Gurobi heuristics fraction (default: {HEURISTICS_FRAC})")
+
+    # Run metadata
+    parser.add_argument("--run-name", default=RUN_NAME, help="Optional run name, saved into the output JSON only")
+    parser.add_argument("--principal-set", action="store_true", default=IS_PRINCIPAL_SET, help="Mark this run as part of a principal research set")
 
     # AWS
     parser.add_argument("--job-name", default=None, help="Custom Batch job name (auto-generated if omitted)")
@@ -949,7 +949,13 @@ def main() -> None:
                 raise ValueError(f"--target-points entries must be 'Name,lat,lon', got: {entry!r}")
             name, lat, lon = parts[0].strip(), float(parts[1]), float(parts[2])
             target_points.append([name, lat, lon])
-        inc_bounds = list(args.inc_bounds) if args.inc_bounds else list(DEFAULT_INCLINATION_BOUNDS)
+        inc_bounds = list(args.inc_bounds) if args.inc_bounds else list(smart_inclination_bounds(target_points))
+        slug = target_points[0][0].lower().replace(" ", "-").replace(":", "").replace("/", "-")[:20]
+    elif args.target_points_csv:
+        target_mode   = "prespecified"
+        country       = None
+        target_points = load_target_points_csv(args.target_points_csv)
+        inc_bounds = list(args.inc_bounds) if args.inc_bounds else list(smart_inclination_bounds(target_points))
         slug = target_points[0][0].lower().replace(" ", "-").replace(":", "").replace("/", "-")[:20]
     elif TARGET_MODE == "country":
         target_mode   = "country"
@@ -963,12 +969,12 @@ def main() -> None:
         target_mode   = "prespecified"
         country       = None
         target_points = TARGET_POINTS
-        inc_bounds = list(args.inc_bounds) if args.inc_bounds else list(DEFAULT_INCLINATION_BOUNDS)
+        inc_bounds = list(args.inc_bounds) if args.inc_bounds else list(smart_inclination_bounds(target_points))
         slug = "pacific-3-blobs"
 
     job_name = args.job_name or (
         f"run_{ts}_{slug}"
-        f"_alt{int(args.altitude)}km"
+        f"_alt{int(args.target_altitude)}km"
         f"_s{args.salvo}"
         f"_i{args.interceptors}"
         f"_v{args.vbo:.0f}"
@@ -976,12 +982,15 @@ def main() -> None:
     job_name = job_name[:128]
 
     cfg = {
+        # Run metadata
+        "run_name":                     args.run_name,
+        "is_principal_set":             args.principal_set,
         # Target
         "job_name":                     job_name,
         "target_mode":                  target_mode,
         "target_country":               country,
         "target_points":                target_points,
-        "target_shell_n_points":        args.n_points,
+        "target_shell_n_points":        args.n_points if target_mode == "country" else None,
         "inclination_sweep_bounds_deg": inc_bounds,
         # Engagement
         "v_bo_km_s":                    args.vbo,
@@ -994,22 +1003,17 @@ def main() -> None:
         "intercept_alt_km":             args.intercept_alt,
         "min_elev_deg":                 args.min_elev,
         # Orbit
-        "altitude_override_km":         args.altitude,
+        "target_altitude_km":           args.target_altitude,
         "altitude_max_repeat_days":     args.altitude_max_repeat_days,
-        "use_j2":                       args.use_j2,
         # Seed grid
         "dt_s":                         args.dt,
         "inc_screen_step_deg":          args.inc_step,
         "n_raan_offsets":               args.n_raan,
         "seed_workers":                 args.seed_workers,
         "n_seeds_for_milp":             args.n_seeds,
-        "reserve_polar_orbits":         args.reserve_polar,
         # Solver
         "mip_gap":                      args.mip_gap,
         "time_limit_s":                 args.time_limit,
-        "mip_focus":                    args.mip_focus,
-        "heuristics_frac":              args.heuristics,
-        "solver_params":                SOLVER_PARAMS,
     }
 
     config_key    = f"{S3_CONFIG_PREFIX}/{job_name}.json"
