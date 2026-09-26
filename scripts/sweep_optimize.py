@@ -407,10 +407,17 @@ def _result_subdir_for(
         # of the number changed, from T_WINDOW_S to
         # target_missile_burnout_time_s (numerically identical at defaults).
         / f"intercept-window-{target_missile_burnout_time_s:.0f}s"
-        # New segments for the other two timing dims -- these have no legacy
-        # path convention to preserve, so they're named directly.
-        / f"detection-time-{detection_time_s:.0f}s"
-        / f"decision-time-{decision_time_s:.0f}s"
+        # New segments for the other two timing dims. Named as short
+        # "det"/"dec" (not the fuller "detection-time"/"decision-time" used
+        # in batch_worker.py's/cloud_sweep.py's S3 keys, which have no length
+        # limit) because this path is written to the local filesystem: with
+        # the full labels, a realistic country-mode result path landed at
+        # 257-271 chars, over Windows' 260-char MAX_PATH, and failed with a
+        # bare FileNotFoundError on write. No downstream tooling parses these
+        # two segments by name (only "intercept-window-" is regex-matched by
+        # plot_best_results_by_country.py), so shortening them is safe.
+        / f"det-{detection_time_s:.0f}s"
+        / f"dec-{decision_time_s:.0f}s"
         / f"intercept-alt-{INTERCEPT_ALT_KM:.0f}km"
         / f"max-accel-{a_g:.1f}g"
         / f"orbit-alt-{round(actual_alt_km)}km"
