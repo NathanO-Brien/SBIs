@@ -18,12 +18,11 @@ import numpy as np
 from sbi_coverage.core.config import CoverageConfig, EarthConstants, SimConfig
 from sbi_coverage.core.shell import Shell
 from sbi_coverage.core.simulate import run_simulation
+from sbi_coverage.core.target_points import load_target_points_csv, smart_inclination_bounds
 from sbi_coverage.Lee import (
     build_orb_elems_table,
     build_param_V,
     candidate_rgt_ratios,
-    footprint_half_angles_deg,
-    optimal_sat_altitude_km,
     param_V_summary,
     print_orb_table,
     rgt_common_ground_track_layer,
@@ -42,6 +41,11 @@ TARGET_MODE: str = "country"  # "prespecified" or "country"
 TARGET_POINTS: list[tuple[str, float, float]] = [
     ("NK: Yongbyon (nuclear)", 39.79, 125.66),
 ]
+# If set, overrides TARGET_POINTS above by loading a CSV with a header row
+# containing some case-insensitive variant of Location/Lat/Lon (see
+# sbi_coverage.core.target_points.load_target_points_csv for the exact
+# accepted column names and formatting tolerance).
+TARGET_POINTS_CSV: str | Path | None = None
 
 # For use in country mode
 TARGET_COUNTRY: str | list[str] | tuple[str, ...] = "Brazil"
@@ -66,28 +70,19 @@ A_G: float = 10.0
 INTERCEPT_ALT_KM: float = 200.0
 MIN_ELEV_DEG: float = 0.0
 
-# Inclination sweep configuration
+# Inclination sweep configuration.  Country mode uses this fixed tuple as-is;
+# prespecified mode instead computes a geometry-aware floor from the actual
+# target points -- see smart_inclination_bounds() call in main().
 INCLINATION_SWEEP_BOUNDS_DEG: tuple[float, float] = (0, 90.0)
 INCLINATION_SCREEN_STEP_DEG: float = 1
 
 # Altitude family configuration
-# ALTITUDE_SEARCH_MIN_KM: float = 200.0
-# ALTITUDE_SEARCH_MAX_KM: float = 700.0
-# ALTITUDE_MAX_FAMILIES: int = 1
-# ALTITUDE_MIN_SEPARATION_KM: float = 25.0
 ALTITUDE_MAX_REPEAT_DAYS: int = 2
 
-# Set to a specific altitude (km) to bypass the geometric h* search and snap to
-# the nearest RGT orbit at that altitude (N_D ≤ ALTITUDE_MAX_REPEAT_DAYS).
-# Leave as None to use the geometrically optimal h*.
-ALTITUDE_OVERRIDE_KM: float | None = 400
-
-# J2 perturbation model.  When True, the propagator applies secular J2 rates
-# (RAAN drift, argp drift) and the RGT repeat period is computed at the J2-
-# correct altitude for the reference inclination.  When False, Keplerian
-# dynamics are used and the APC circulant property is exact for all
-# inclinations — coverage output is guaranteed 100% by construction.
-USE_J2: bool = False
+# Required target altitude (km); snapped to the nearest RGT orbit
+# (N_D ≤ ALTITUDE_MAX_REPEAT_DAYS). Both this value and the actual snapped
+# altitude are saved to the output JSON as target_altitude_km/actual_alt_km.
+TARGET_ALTITUDE_KM: float = 400.0
 
 # Seed simulation configuration
 # Number of RAAN phase offsets sampled per inclination.  Values are evenly
@@ -100,13 +95,6 @@ SEED_SCREENING_WORKERS: int = 8
 # Number of seed orbits passed to the MILP after greedy marginal-coverage
 # ranking.  All seeds are simulated; only the best N are given to Gurobi.
 N_SEEDS_FOR_MILP: int = 10
-# When True, three polar seeds are reserved before the greedy runs — one each
-# at inc = 80°, 85°, and 90°.  For each inclination the seed with the highest
-# total target access (best RAAN) is chosen from the simulated pool.  Seeds
-# that are missing from the grid (e.g. because INCLINATION_SCREEN_STEP_DEG is
-# coarser than 5°) are silently skipped.  Each reservation counts against the
-# N_SEEDS_FOR_MILP cap.
-RESERVE_POLAR_ORBITS: bool = False
 
 # ---------------------------------------------------------------------------
 # Intercept salvo parameters
@@ -115,40 +103,22 @@ SALVO_SIZE: int = 2
 N_INTERCEPTORS_PER_SAT: int = 1
 
 # ---------------------------------------------------------------------------
+# Run metadata (optional; saved into the output JSON only -- never used for
+# file/folder naming, which is unaffected by these).
+# ---------------------------------------------------------------------------
+RUN_NAME: str | None = None
+IS_PRINCIPAL_SET: bool = False
+
+# ---------------------------------------------------------------------------
 # Solver options
 # ---------------------------------------------------------------------------
 MIP_GAP: float = 0.001
 TIME_LIMIT_S: float = 45
-# MIPFocus=1: prioritise finding feasible incumbents fast (best for sweep / large
-# grids where the first solution is hard to find).  Switch to 2 when you want
-# Gurobi to focus on proving optimality once a good incumbent already exists.
-MIP_FOCUS: int = 1
-# Fraction of B&B time Gurobi spends on primal heuristics.  Default is 0.05;
-# 0.2–0.3 helps significantly when the first incumbent is the bottleneck.
-HEURISTICS_FRAC: float = 0.2
-# Additional Gurobi parameter overrides.  Applied after MIP_FOCUS and
-# HEURISTICS_FRAC, so any key here takes full precedence.  Set a key to
-# None to let Gurobi use its own default for that parameter.
-# Note: CoverCuts=2, Cuts=2, and LPWarmStart=1 are already hardcoded in
-# the solver and do not need to be repeated here.
-SOLVER_PARAMS: dict = {
-    # Method 1 = dual simplex. Previously Method 2 (Barrier) — barrier took 300s+ on root LP
-    # and crossover added another 70s. For pure 0/1 set-cover with an all-ones matrix,
-    # dual simplex is faster because the matrix is sparse and simplex exploits that.
-    "Method":                1,
-    # Write B&B nodes to disk at 4 GB — prevents OOM during branching.
-    "NodefileStart":         4,
-    # RINS heuristic every 50 nodes — this is what actually finds good solutions.
-    # B&B alone cannot explore enough nodes on problems of this size.
-    "RINS":                  50,
-    # Presolve removed 0 rows and 0 columns in testing (pure 0/1 set-cover gives it
-    # nothing to exploit) while consuming 268s. Disabled.
-    # Previously: "Presolve": 2
-    # No-improvement termination: stop if no incumbent improvement for 1 hour,
-    # but don't start that clock until 3 hours in — gives RINS time to find its
-    # first solution on hard instances before the termination check activates.
-    # Previously used a fixed TimeLimit only, which wasted hours on a stalled solver.
-}
+# mip_focus/heuristics_frac/solver_params are intentionally not overridden
+# here -- solve_sclp() now defaults to vanilla Gurobi tuning (MIPFocus=0,
+# Heuristics=0.05, no solver_params overrides). The architecture to
+# specialize these per-run is still in solve_sclp()'s signature; pass them
+# explicitly again here if/when that's worth re-enabling.
 LOG_DIR: Path | None = Path("logFiles")
 RESULTS_DIR: Path = Path("results")
 
@@ -170,93 +140,6 @@ def _dedupe_altitudes_km(values_km: list[float], *, tol_km: float = 1e-6) -> lis
         if not any(abs(x - existing) <= tol_km for existing in out):
             out.append(x)
     return out
-
-
-def _enumerate_exact_rgt_altitudes_for_repeat_days(
-    *,
-    N_D: int,
-    min_alt_km: float,
-    max_alt_km: float,
-    dt_s: float,
-    earth: EarthConstants,
-    max_n_p: int = 512,
-) -> list[dict[str, float | int]]:
-    out: list[dict[str, float | int]] = []
-    for N_P in range(1, max_n_p + 1):
-        if np.gcd(N_P, N_D) != 1:
-            continue
-
-        T_sid = (2.0 * np.pi) / earth.omega_earth_rad_s
-        T_r_s = N_D * T_sid
-        T_S_s = T_r_s / N_P
-        a_km = (earth.mu_km3_s2 * (T_S_s / (2.0 * np.pi)) ** 2) ** (1.0 / 3.0)
-        alt_km = float(a_km - earth.r_eq_km)
-        if alt_km < min_alt_km or alt_km > max_alt_km:
-            continue
-        out.append(
-            {
-                "N_P": int(N_P),
-                "N_D": int(N_D),
-                "alt_km": float(alt_km),
-                "alt_error_km": 0.0,
-                "T_r_s": float(T_r_s),
-                "T_S_s": float(T_S_s),
-                "L": int(round(T_r_s / float(dt_s))),
-            }
-        )
-    out.sort(key=lambda item: float(item["alt_km"]))
-    return out
-
-
-def _select_band_search_altitude_families(
-    *,
-    h_star_km: float,
-    cov: CoverageConfig,
-    earth: EarthConstants,
-    dt_s: float,
-) -> tuple[int, int, list[dict[str, float | int]]]:
-    best_choice: tuple[float, int, int, list[dict[str, float | int]]] | None = None
-
-    for N_D in range(1, ALTITUDE_MAX_REPEAT_DAYS + 1):
-        families = _enumerate_exact_rgt_altitudes_for_repeat_days(
-            N_D=N_D,
-            min_alt_km=max(float(cov.intercept_alt_km), float(ALTITUDE_SEARCH_MIN_KM)),
-            max_alt_km=float(ALTITUDE_SEARCH_MAX_KM),
-            dt_s=dt_s,
-            earth=earth,
-        )
-        if not families:
-            continue
-
-        nearest_error = min(abs(float(item["alt_km"]) - float(h_star_km)) for item in families)
-        candidate = (nearest_error, -len(families), N_D, families)
-        if best_choice is None or candidate[:3] < best_choice[:3]:
-            best_choice = candidate
-
-    if best_choice is None:
-        raise ValueError(
-            "band_search found no exact RGT altitude families in the requested altitude band. "
-            "Adjust ALTITUDE_SEARCH_MIN_KM / ALTITUDE_SEARCH_MAX_KM or ALTITUDE_MAX_REPEAT_DAYS."
-        )
-
-    N_D = int(best_choice[2])
-    families = list(best_choice[3])
-    families.sort(key=lambda item: abs(float(item["alt_km"]) - float(h_star_km)))
-
-    selected: list[dict[str, float | int]] = []
-    for family in families:
-        alt_km = float(family["alt_km"])
-        if any(abs(alt_km - float(existing["alt_km"])) < ALTITUDE_MIN_SEPARATION_KM for existing in selected):
-            continue
-        selected.append(family)
-        if len(selected) >= ALTITUDE_MAX_FAMILIES:
-            break
-
-    if not selected:
-        raise ValueError("band_search did not retain any altitude families after separation filtering.")
-
-    L = int(selected[0]["L"])
-    return N_D, L, selected
 
 
 def _build_target_shell(earth: EarthConstants, cov: CoverageConfig) -> tuple[Shell, list[str], np.ndarray, np.ndarray]:
@@ -322,12 +205,19 @@ def _result_subdir(actual_alt_km: float) -> Path:
     else:
         name = TARGET_POINTS[0][0] if TARGET_POINTS else "target"
         name_slug = (
-            name.lower()
+            name.strip().lower()
             .replace(" ", "-")
             .replace(":", "")
             .replace("(", "")
             .replace(")", "")
-        )
+            .replace("/", "-")
+        )[:20]  # truncated -- the full results hierarchy underneath this name
+        # (burnout-vel/.../salvo-size/<timestamp>_result.csv) adds ~180-200
+        # more characters, so an untruncated real-world target name (this repo's
+        # own absolute path already accounts for ~50 of Windows' 260-char
+        # budget) can exceed the limit and fail with a plain FileNotFoundError.
+        # batch_worker.py's equivalent S3-prefix slug uses [:40] since S3 keys
+        # have no such limit; this is deliberately tighter for the local path.
         top = RESULTS_DIR / "prespecified" / name_slug
 
     path = (
@@ -349,33 +239,25 @@ def _result_subdir(actual_alt_km: float) -> Path:
     return path
 
 
-_POLAR_RESERVATION_INCLINATIONS: tuple[float, ...] = (80.0, 85.0, 90.0)
-
-
 def _greedy_select_seeds(
     v0_list: list[np.ndarray],
     r_required: int,
     n_max: int,
     *,
     inc_deg_list: list[float] | None = None,
-    reserve_polar_orbits: bool = False,
 ) -> list[int]:
     """Greedy marginal-coverage seed selection.
 
-    Three-phase selection:
-
-    Phase 0 — Polar reservation (if reserve_polar_orbits is True):
-        Pre-select the best-RAAN seed for each inclination in
-        _POLAR_RESERVATION_INCLINATIONS before any other selection runs.
+    Two-phase selection:
 
     Phase 1 — Inclination guarantee:
-        Every discrete inclination value present in inc_deg_list that was not
-        already covered by Phase 0 is guaranteed exactly one representative.
-        Among all RAAN candidates for a given inclination the one with the
-        highest marginal-coverage score is chosen (unique access against the
-        current deficit; total access once deficit is met).  Inclinations are
-        processed in greedy order — whichever missing inclination's best
-        candidate contributes the most is selected first.
+        Every discrete inclination value present in inc_deg_list is
+        guaranteed exactly one representative. Among all RAAN candidates for
+        a given inclination the one with the highest marginal-coverage score
+        is chosen (unique access against the current deficit; total access
+        once deficit is met).  Inclinations are processed in greedy order —
+        whichever missing inclination's best candidate contributes the most
+        is selected first.
 
     Phase 2 — Greedy fill:
         Remaining n_max slots are filled by the standard greedy marginal-
@@ -388,24 +270,6 @@ def _greedy_select_seeds(
     deficit   = np.full(access.shape[1], float(r_required))
     selected: list[int] = []
     remaining = list(range(n_seeds))
-
-    # ------------------------------------------------------------------
-    # Phase 0: Polar reservation
-    # ------------------------------------------------------------------
-    if reserve_polar_orbits and inc_deg_list is not None and n_max >= 1:
-        for target_inc in _POLAR_RESERVATION_INCLINATIONS:
-            if len(selected) >= n_max:
-                break
-            candidates = [
-                i for i in remaining
-                if abs(inc_deg_list[i] - target_inc) < 0.1
-            ]
-            if not candidates:
-                continue
-            best = max(candidates, key=lambda i: access[i].sum())
-            selected.append(best)
-            deficit = np.maximum(0.0, deficit - access[best])
-            remaining.remove(best)
 
     # ------------------------------------------------------------------
     # Phase 1: Inclination guarantee — every unique inclination gets one rep
@@ -466,6 +330,10 @@ def _greedy_select_seeds(
 
 
 def main() -> None:
+    global TARGET_POINTS
+    if str(TARGET_MODE).strip().lower() == "prespecified" and TARGET_POINTS_CSV:
+        TARGET_POINTS = load_target_points_csv(TARGET_POINTS_CSV)
+
     countries = _normalize_country_input(TARGET_COUNTRY)
     if not countries:
         raise ValueError("TARGET_COUNTRY must contain at least one country.")
@@ -491,97 +359,53 @@ def main() -> None:
     )
     print(f"Computed R_max: {cov.max_range_km:.2f} km")
 
-    h_star = optimal_sat_altitude_km(
-        max_range_km=cov.max_range_km,
-        min_elev_deg=cov.min_elev_deg,
-        intercept_alt_km=cov.intercept_alt_km,
+    # Snap to the nearest N_D ≤ ALTITUDE_MAX_REPEAT_DAYS RGT orbit at the
+    # requested target altitude.
+    candidates = candidate_rgt_ratios(
+        h_star_km=TARGET_ALTITUDE_KM,
         earth=earth,
+        max_repeat_days=ALTITUDE_MAX_REPEAT_DAYS,
+        dt_s=DT_S,
     )
-    angles = footprint_half_angles_deg(
-        h_sat_km=h_star,
-        max_range_km=cov.max_range_km,
-        min_elev_deg=cov.min_elev_deg,
-        intercept_alt_km=cov.intercept_alt_km,
-        earth=earth,
+    if not candidates:
+        raise ValueError(
+            f"No RGT orbit found near TARGET_ALTITUDE_KM={TARGET_ALTITUDE_KM} km "
+            f"with N_D ≤ {ALTITUDE_MAX_REPEAT_DAYS}.  Raise ALTITUDE_MAX_REPEAT_DAYS "
+            "or choose a different altitude."
+        )
+    best = candidates[0]
+    N_P             = int(best["N_P"])
+    N_D             = int(best["N_D"])
+    L               = int(best["L"])
+    altitude_ratios = [best]
+    altitude_ref_km = float(TARGET_ALTITUDE_KM)
+    print(
+        f"\nTarget altitude requested: {TARGET_ALTITUDE_KM:.1f} km  →  "
+        f"nearest RGT orbit: {best['N_P']}:{best['N_D']}  "
+        f"actual_alt={float(best['alt_km']):.2f} km  "
+        f"(snap error: {float(best['alt_error_km']):.2f} km)"
     )
-    print(f"Optimal satellite altitude (h*): {h_star:.2f} km")
-    print(f"  rho_eff: {angles['rho_eff_deg']:.4f} deg  (binding: {angles['binding']})")
-
-    if ALTITUDE_OVERRIDE_KM is not None:
-        # Altitude override: snap to the nearest N_D ≤ ALTITUDE_MAX_REPEAT_DAYS
-        # RGT orbit at the requested altitude instead of the geometric h*.
-        candidates = candidate_rgt_ratios(
-            h_star_km=ALTITUDE_OVERRIDE_KM,
-            earth=earth,
-            max_repeat_days=ALTITUDE_MAX_REPEAT_DAYS,
-            dt_s=DT_S,
-        )
-        if not candidates:
-            raise ValueError(
-                f"No RGT orbit found near ALTITUDE_OVERRIDE_KM={ALTITUDE_OVERRIDE_KM} km "
-                f"with N_D ≤ {ALTITUDE_MAX_REPEAT_DAYS}.  Raise ALTITUDE_MAX_REPEAT_DAYS "
-                "or choose a different altitude."
-            )
-        best = candidates[0]
-        N_P             = int(best["N_P"])
-        N_D             = int(best["N_D"])
-        L               = int(best["L"])
-        altitude_ratios = [best]
-        altitude_ref_km = float(ALTITUDE_OVERRIDE_KM)
-        print(
-            f"\nAltitude OVERRIDE requested: {ALTITUDE_OVERRIDE_KM:.1f} km  →  "
-            f"nearest RGT orbit: {best['N_P']}:{best['N_D']}  "
-            f"actual_alt={float(best['alt_km']):.2f} km  "
-            f"(snap error: {float(best['alt_error_km']):.2f} km)"
-        )
-    else:
-        N_D, L, altitude_ratios = _select_band_search_altitude_families(
-            h_star_km=h_star,
-            cov=cov,
-            earth=earth,
-            dt_s=DT_S,
-        )
-        N_P             = int(altitude_ratios[0]["N_P"])
-        altitude_ref_km = float(h_star)
-        print("\nAltitude families:")
-        for ratio in altitude_ratios:
-            print(f"  exact_RGT={ratio['N_P']}:{ratio['N_D']}  actual_alt={float(ratio['alt_km']):.2f} km")
 
     shared_worst_error = max(abs(float(item["alt_km"]) - altitude_ref_km) for item in altitude_ratios)
     actual_alt_km      = float(altitude_ratios[0]["alt_km"])
 
-    # J2-correct T_r and L: use the exact RGT repeat period at a reference
-    # inclination (midpoint of the sweep).  With J2-corrected a_km (from
-    # a_km_j2_rgt), the orbit repeats precisely after T_r_j2 seconds, making
-    # the circulant V matrix exact for ALL entries including wrap-arounds.
-    # This eliminates the residual ~0.04 % coverage gap caused by the
-    # Keplerian T_r ≠ J2-correct T_r mismatch.
-    if USE_J2:
-        from sbi_coverage.Lee.rgt_slots import a_km_j2_rgt as _a_km_j2_rgt
-        _inc_ref     = float(np.mean(INCLINATION_SWEEP_BOUNDS_DEG))
-        _a_j2        = _a_km_j2_rgt(N_P, N_D, _inc_ref, earth)
-        _n_j2        = float(np.sqrt(earth.mu_km3_s2 / _a_j2**3))
-        _fac_j2      = 1.5 * earth.j2 * (earth.r_eq_km / _a_j2)**2 * _n_j2
-        _od_j2       = 0.5 * _fac_j2 * (5.0 * np.cos(np.deg2rad(_inc_ref))**2 - 1.0)
-        _T_r_j2      = N_P * 2.0 * np.pi / (_n_j2 + _od_j2)
-        L            = round(_T_r_j2 / DT_S)
-        dt_s_actual  = _T_r_j2 / L
-    else:
-        dt_s_actual  = float(altitude_ratios[0]["T_r_s"]) / L
+    # Keplerian T_r/L: the APC circulant property is exact for all
+    # inclinations under Keplerian dynamics -- coverage output is guaranteed
+    # 100% by construction.
+    dt_s_actual = float(altitude_ratios[0]["T_r_s"]) / L
 
     horizon_s = (L - 1) * dt_s_actual
     print(
         f"\nShared repeat family: N_D={N_D}  L={L} steps  "
         f"(worst altitude mapping error across families = {shared_worst_error:.3f} km)"
     )
-    _tr_label = "J2-corrected T_r/L" if USE_J2 else "Keplerian T_r/L"
-    print(f"dt_s: {DT_S:.4f} s (nominal) → {dt_s_actual:.6f} s ({_tr_label})")
+    print(f"dt_s: {DT_S:.4f} s (nominal) → {dt_s_actual:.6f} s (Keplerian T_r/L)")
 
     sim = SimConfig(
         horizon_s=horizon_s,
         dt_s=dt_s_actual,
         analysis_matrix_dtype="uint8",
-        use_j2=USE_J2,
+        use_j2=False,
         use_drag=False,
     )
     print(f"Simulation horizon: {horizon_s:.1f} s  ({horizon_s/3600:.3f} h)  -> L={L}")
@@ -606,20 +430,19 @@ def main() -> None:
     fam  = altitude_ratios[0]
     N_P  = int(fam["N_P"])
 
-    inc_lo, inc_hi = INCLINATION_SWEEP_BOUNDS_DEG
+    # Country mode uses the fixed INCLINATION_SWEEP_BOUNDS_DEG tuple as-is;
+    # prespecified mode computes a geometry-aware floor from the actual
+    # target points (narrows the search instead of always sweeping 0-90).
+    if str(TARGET_MODE).strip().lower() == "prespecified":
+        inc_bounds = smart_inclination_bounds(TARGET_POINTS)
+    else:
+        inc_bounds = INCLINATION_SWEEP_BOUNDS_DEG
+    inc_lo, inc_hi = inc_bounds
     inc_grid  = np.arange(
         float(inc_lo),
         float(inc_hi) + float(INCLINATION_SCREEN_STEP_DEG) * 0.5,
         float(INCLINATION_SCREEN_STEP_DEG),
     )
-
-    # When polar reservation is active, ensure every inclination in
-    # _POLAR_RESERVATION_INCLINATIONS (80°, 85°, 90°) is simulated,
-    # regardless of INCLINATION_SCREEN_STEP_DEG.  np.unique deduplicates any
-    # values already present in the main grid and keeps everything sorted.
-    if RESERVE_POLAR_ORBITS:
-        polar_extra = np.array(list(_POLAR_RESERVATION_INCLINATIONS), dtype=np.float64)
-        inc_grid    = np.unique(np.concatenate([inc_grid, polar_extra]))
 
     raan_interval = 360.0 / N_P
     raan_grid     = np.linspace(0.0, raan_interval, N_RAAN_OFFSETS, endpoint=False)
@@ -627,27 +450,16 @@ def main() -> None:
     seed_pairs    = [(float(inc), float(raan)) for inc in inc_grid for raan in raan_grid]
     n_seeds       = len(seed_pairs)
     n_seeds_total = n_seeds
-    n_polar_extra = int(sum(
-        1 for p in _POLAR_RESERVATION_INCLINATIONS
-        if not any(abs(p - g) < 0.01 for g in np.arange(
-            float(inc_lo),
-            float(inc_hi) + float(INCLINATION_SCREEN_STEP_DEG) * 0.5,
-            float(INCLINATION_SCREEN_STEP_DEG),
-        ))
-    )) if RESERVE_POLAR_ORBITS else 0
     print(
         f"\nSeed grid: {len(inc_grid)} inclinations × {N_RAAN_OFFSETS} RAANs = {n_seeds} seeds"
     )
-    print(f"  inclinations : {float(inc_lo):.1f}°–{float(inc_hi):.1f}° step {float(INCLINATION_SCREEN_STEP_DEG):.1f}°"
-          + (f"  (+{n_polar_extra} polar at 5° steps)" if n_polar_extra > 0 else ""))
+    print(f"  inclinations : {float(inc_lo):.1f}°–{float(inc_hi):.1f}° step {float(INCLINATION_SCREEN_STEP_DEG):.1f}°")
     print(f"  RAANs        : {N_RAAN_OFFSETS} offsets in [0°, {raan_interval:.3f}°)  "
           f"(360° / N_P={N_P})  step={raan_interval / N_RAAN_OFFSETS:.3f}°")
 
     # ------------------------------------------------------------------
     # Build sub-layers and simulate all seeds in parallel
     # ------------------------------------------------------------------
-    _a_km_ref  = _a_j2        if sim.use_j2 else None
-    _dt_s_slot = dt_s_actual  if sim.use_j2 else None
     sub_layers = [
         rgt_common_ground_track_layer(
             inc_deg=inc,
@@ -656,9 +468,7 @@ def main() -> None:
             L=L,
             earth=earth,
             raan0_deg=raan,
-            use_j2=sim.use_j2,
-            a_km_override=_a_km_ref,
-            dt_s=_dt_s_slot,
+            use_j2=False,
         )
         for inc, raan in seed_pairs
     ]
@@ -715,7 +525,6 @@ def main() -> None:
     greedy_idx   = _greedy_select_seeds(
         v0_list, r_required, N_SEEDS_FOR_MILP,
         inc_deg_list=inc_deg_list,
-        reserve_polar_orbits=RESERVE_POLAR_ORBITS,
     )
     n_selected = len(greedy_idx)
     print(f"\nGreedy seed selection: {n_selected} of {n_seeds} live seeds → MILP")
@@ -732,35 +541,18 @@ def main() -> None:
         f"requirement={r_required}  "
         + ("✓ feasible" if feasible_proxy else "⚠ may be infeasible — consider raising N_SEEDS_FOR_MILP")
     )
-    # Tag seeds by selection phase: polar-reserved, inc-guaranteed, or greedy fill.
-    polar_reserved_set: dict[int, float] = {}   # idx → reserved inclination
-    if RESERVE_POLAR_ORBITS and inc_deg_list:
-        for idx in greedy_idx:
-            inc_val = inc_deg_list[idx]
-            for target_inc in _POLAR_RESERVATION_INCLINATIONS:
-                if abs(inc_val - target_inc) < 0.1 and target_inc not in polar_reserved_set.values():
-                    polar_reserved_set[idx] = target_inc
-                    break
-            if len(polar_reserved_set) >= len(_POLAR_RESERVATION_INCLINATIONS):
-                break
+    # Tag seeds by selection phase: inc-guaranteed, or greedy fill.
     inc_guaranteed_set: set[int] = set()
     if inc_deg_list:
-        _seen_incs: set[float] = {inc_deg_list[i] for i in polar_reserved_set}
+        _seen_incs: set[float] = set()
         for idx in greedy_idx:
-            if idx in polar_reserved_set:
-                continue
             _inc_val = inc_deg_list[idx]
             if _inc_val not in _seen_incs:
                 inc_guaranteed_set.add(idx)
                 _seen_incs.add(_inc_val)
     for rank, idx in enumerate(greedy_idx):
         inc, raan = seed_pairs[idx]
-        if idx in polar_reserved_set:
-            tag = f"  [polar reserved {polar_reserved_set[idx]:.0f}°]"
-        elif idx in inc_guaranteed_set:
-            tag = "  [inc. guaranteed]"
-        else:
-            tag = ""
+        tag = "  [inc. guaranteed]" if idx in inc_guaranteed_set else ""
         print(f"  {rank + 1:2d}: i={inc:5.1f}°  RAAN={raan:6.1f}°  "
               f"access/target={v0_list[idx].sum(axis=0).mean():.1f}{tag}")
 
@@ -801,9 +593,6 @@ def main() -> None:
         time_limit_s=TIME_LIMIT_S,
         log_file=log_file,
         verbose=True,
-        mip_focus=MIP_FOCUS,
-        heuristics_frac=HEURISTICS_FRAC,
-        solver_params=SOLVER_PARAMS,
     )
 
     print("\n" + "=" * 60)
@@ -824,11 +613,14 @@ def main() -> None:
     csv_path = out_dir / f"{ts}_result.csv"
 
     run_config = {
+        # --- Run metadata ---
+        "run_name":                       RUN_NAME,
+        "is_principal_set":               IS_PRINCIPAL_SET,
         # --- Target ---
         "target_mode":                    TARGET_MODE,
         "target_country":                 TARGET_COUNTRY if TARGET_MODE == "country" else None,
         "target_points":                  [list(p) for p in TARGET_POINTS] if TARGET_MODE != "country" else None,
-        "target_shell_n_points":          TARGET_SHELL_N_POINTS,
+        "target_shell_n_points":          TARGET_SHELL_N_POINTS if TARGET_MODE == "country" else None,
         "n_targets":                      int(n_targets),
         # --- Engagement physics ---
         "dt_s":                           dt_s_actual,
@@ -843,15 +635,14 @@ def main() -> None:
         "min_elev_deg":                   MIN_ELEV_DEG,
         "r_max_km":                       float(cov.max_range_km),
         # --- Orbit ---
-        "altitude_override_km":           ALTITUDE_OVERRIDE_KM,
+        "target_altitude_km":             TARGET_ALTITUDE_KM,
         "altitude_max_repeat_days":       ALTITUDE_MAX_REPEAT_DAYS,
-        "h_star_km":                      float(h_star),
         "actual_alt_km":                  float(actual_alt_km),
         "rgt_ratio":                      f"{N_P}:{N_D}",
         "L":                              int(L),
         "horizon_s":                      float(horizon_s),
         # --- Seed grid ---
-        "inclination_sweep_bounds_deg":   list(INCLINATION_SWEEP_BOUNDS_DEG),
+        "inclination_sweep_bounds_deg":   list(inc_bounds),
         "inclination_screen_step_deg":    INCLINATION_SCREEN_STEP_DEG,
         "n_raan_offsets":                  N_RAAN_OFFSETS,
         "raan_interval_deg":              float(raan_interval),
@@ -859,8 +650,6 @@ def main() -> None:
         "n_seeds_simulated":              int(n_seeds_total),
         "n_seeds_live":                   int(n_seeds_live),
         "n_seeds_for_milp":               N_SEEDS_FOR_MILP,
-        "reserve_polar_orbits":           RESERVE_POLAR_ORBITS,
-        "polar_reservation_inclinations": list(_POLAR_RESERVATION_INCLINATIONS) if RESERVE_POLAR_ORBITS else [],
         "seeds_selected": [
             {
                 "rank":     rank + 1,
@@ -876,8 +665,6 @@ def main() -> None:
         # --- Solver ---
         "mip_gap_target":                 MIP_GAP,
         "time_limit_s":                   None if TIME_LIMIT_S == float("inf") else TIME_LIMIT_S,
-        "mip_focus":                      MIP_FOCUS,
-        "heuristics_frac":                HEURISTICS_FRAC,
         # --- Result summary ---
         "timestamp_utc":                  datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "result_status":                  result.status_str,

@@ -200,8 +200,8 @@ def solve_sclp(
     time_limit_s: float = float("inf"),
     log_file: str | Path | None = None,
     verbose: bool = True,
-    mip_focus: int = 1,
-    heuristics_frac: float = 0.2,
+    mip_focus: int = 0,
+    heuristics_frac: float = 0.05,
     solver_params: dict[str, Any] | None = None,
 ) -> SCLPResult:
     """Solve the SCLP using Gurobi.
@@ -233,14 +233,16 @@ def solve_sclp(
         If False, suppress all Gurobi console output.
     mip_focus : int
         Gurobi MIPFocus parameter (0–3).
+        0 = balanced/automatic (Gurobi's own default).
         1 = find feasible solutions fast (good default for sweep / large problems).
         2 = close the optimality gap (better when first incumbent is easy to find).
         3 = tighten the best bound (rarely useful here).
-        Default: 1.
+        Default: 0 (Gurobi's own default -- no repo-specific tuning applied;
+        pass 1 explicitly to get the old sweep-friendly behavior back).
     heuristics_frac : float
         Fraction of B&B time Gurobi spends on primal heuristics (0–1).
         Higher values help find the first incumbent faster at the cost of
-        slower bound improvement.  Default: 0.2 (vs Gurobi's built-in 0.05).
+        slower bound improvement.  Default: 0.05 (Gurobi's own default).
     solver_params : dict, optional
         Arbitrary Gurobi parameter overrides applied after all defaults.
         Keys are Gurobi parameter name strings; values are the desired
