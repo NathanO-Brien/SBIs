@@ -151,6 +151,13 @@ N_INTERCEPTORS_PER_SAT: int = 1
 # ---------------------------------------------------------------------------
 MIP_GAP: float = 0.001
 TIME_LIMIT_S: float = 45
+# If set, stop as soon as a live incumbent's gap drops below this value,
+# regardless of TIME_LIMIT_S -- e.g. 0.999999 stops as soon as any
+# non-trivial lower bound is established (gap under 100%). None: no early
+# stop beyond MIP_GAP/TIME_LIMIT_S. Intended for quickly comparing seed
+# pools/problem sizes across test runs without waiting out a full time
+# budget on each one.
+STOP_AT_GAP: float | None = None
 # MIPFocus=1: prioritise finding feasible incumbents fast (best for sweep / large
 # grids where the first solution is hard to find).  Switch to 2 when you want
 # Gurobi to focus on proving optimality once a good incumbent already exists.
@@ -958,6 +965,7 @@ def main() -> None:
         mip_focus=MIP_FOCUS,
         heuristics_frac=HEURISTICS_FRAC,
         solver_params=SOLVER_PARAMS,
+        stop_at_gap=STOP_AT_GAP,
     )
 
     print("\n" + "=" * 60)
@@ -1040,6 +1048,7 @@ def main() -> None:
         # --- Solver ---
         "mip_gap_target":                 MIP_GAP,
         "time_limit_s":                   None if TIME_LIMIT_S == float("inf") else TIME_LIMIT_S,
+        "stop_at_gap":                    STOP_AT_GAP,
         "mip_focus":                      MIP_FOCUS,
         "heuristics_frac":                HEURISTICS_FRAC,
         # --- Result summary ---

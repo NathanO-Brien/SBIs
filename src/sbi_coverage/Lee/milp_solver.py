@@ -100,12 +100,19 @@ def _sanitize_callback_obj(value: float) -> float | None:
     return value
 
 
-def _make_sclp_callback(header_every: int = 25) -> Callable:
+def _make_sclp_callback(header_every: int = 25, stop_at_gap: float | None = None) -> Callable:
     """Return a Gurobi callback that prints a fixed-width B&B progress table.
 
     Suppressing Gurobi's native console output and routing through this
     callback ensures every column stays in exactly the same horizontal
     position regardless of how many digits the objective values contain.
+
+    stop_at_gap, if given, terminates the solve as soon as the periodic MIP
+    callback observes a live incumbent whose gap (matching Gurobi's own
+    |ObjBst - ObjBnd| / |ObjBst| formula) drops below that threshold -- e.g.
+    stop_at_gap=0.999999 stops as soon as ANY non-trivial lower bound is
+    established (gap below 100%), useful for quickly comparing seed pools
+    without waiting out a full time limit on every test.
     """
     state = {"rows": 0, "last_rem": 0}
 
@@ -138,6 +145,15 @@ def _make_sclp_callback(header_every: int = 25) -> Callable:
             _maybe_header()
             print(_progress_row(" ", expl, rem, inc, bd, t))
             state["rows"] += 1
+
+            if (
+                stop_at_gap is not None
+                and np.isfinite(raw_inc)
+                and raw_inc != 0.0
+            ):
+                gap = abs(raw_inc - raw_bd) / abs(raw_inc)
+                if gap < stop_at_gap:
+                    model.terminate()
 
     return callback
 
@@ -203,6 +219,7 @@ def solve_sclp(
     mip_focus: int = 1,
     heuristics_frac: float = 0.2,
     solver_params: dict[str, Any] | None = None,
+    stop_at_gap: float | None = None,
 ) -> SCLPResult:
     """Solve the SCLP using Gurobi.
 
@@ -255,6 +272,16 @@ def solve_sclp(
                 "Presolve":      2,    # aggressive presolve
                 "Symmetry":      0,    # disable (circulant near-symmetry)
             }
+
+    stop_at_gap : float, optional
+        If set, terminate the solve as soon as a live incumbent's gap drops
+        below this value -- e.g. 0.999999 stops as soon as any non-trivial
+        lower bound is established (gap under 100%), well short of proving
+        the mip_gap tolerance. Only checked when verbose=True (it hooks into
+        the same progress callback). Intended for quickly comparing seed
+        pools/problem sizes across test runs without waiting out a full
+        time_limit_s on each one. None (default): no early termination
+        beyond mip_gap/time_limit_s.
 
     Returns
     -------
@@ -366,7 +393,7 @@ def solve_sclp(
     # Solve — Ctrl+C stops Gurobi and returns best incumbent
     # ------------------------------------------------------------------
     t_solve_start = time.perf_counter()
-    callback = _make_sclp_callback() if verbose else None
+    callback = _make_sclp_callback(stop_at_gap=stop_at_gap) if verbose else None
     try:
         m.optimize(callback)
     except KeyboardInterrupt:
