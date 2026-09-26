@@ -26,8 +26,11 @@ import datetime
 import itertools
 import json
 import sys
+from pathlib import Path
 
 import boto3
+
+from sbi_coverage.core.target_points import load_target_points_csv, smart_inclination_bounds
 
 # ---------------------------------------------------------------------------
 # AWS / S3 configuration — edit to match your deployment
@@ -42,48 +45,38 @@ AWS_REGION:         str = "us-east-1"
 # Fixed parameters — must match sweep_optimize.py / batch_worker.py exactly.
 # ---------------------------------------------------------------------------
 TARGET_SHELL_N_POINTS:      int   = 15000
-USE_J2:                     bool  = False
 MIP_GAP:                    float = 0.001
 TIME_LIMIT_S:               float = 14400.0
 ALTITUDE_MAX_REPEAT_DAYS:   int   = 2
 DT_S:                       float = 120.0
-# Old T_WINDOW_S (time from target launch to intercept, assumed == interceptor
-# flyout time) split into three inputs -- see CoverageConfig's docstring for
-# the derivation. Defaults (0, 0) leave TARGET_MISSILE_BURNOUT_TIME_S == the
-# old T_WINDOW_S value, unchanged.
-DETECTION_TIME_S:           float = 0.0
-DECISION_TIME_S:            float = 0.0
-TARGET_MISSILE_BURNOUT_TIME_S: float = 170.0
-A_G:                        float = 10.0
 INTERCEPT_ALT_KM:           float = 200.0
 MIN_ELEV_DEG:               float = 0.0
 INC_SCREEN_STEP_DEG:        float = 1.0
 N_RAAN_OFFSETS:             int   = 10
 SEED_WORKERS:               int   = 8
-RESERVE_POLAR_ORBITS:       bool  = False
-MIP_FOCUS:                  int   = 1
-HEURISTICS_FRAC:            float = 0.2
-SOLVER_PARAMS:              dict  = {
-    # Method 1 = dual simplex. Previously Method 2 (Barrier) — barrier took 300s+ on root LP
-    # and crossover added another 70s. For pure 0/1 set-cover with an all-ones matrix,
-    # dual simplex is faster because the matrix is sparse and simplex exploits that.
-    "Method":                1,
-    # Write B&B nodes to disk at 4 GB — prevents OOM during branching.
-    "NodefileStart":         4,
-    # RINS heuristic every 50 nodes — this is what actually finds good solutions.
-    # B&B alone cannot explore enough nodes on problems of this size.
-    "RINS":                  50,
-    # Presolve removed 0 rows and 0 columns in testing (pure 0/1 set-cover gives it
-    # nothing to exploit) while consuming 268s. Disabled.
-    # Previously: "Presolve": 2
-    # No-improvement termination: stop if no incumbent improvement for 1 hour,
-    # but don't start that clock until 3 hours in — gives RINS time to find its
-    # first solution on hard instances before the termination check activates.
-    # Previously used a fixed TimeLimit only, which wasted hours on a stalled solver.
-}
+# mip_focus/heuristics_frac/solver_params are intentionally not exposed here
+# -- batch_worker.py's config schema defaults to vanilla Gurobi tuning
+# (MIPFocus=0, Heuristics=0.05, no solver_params overrides) when these keys
+# are absent from the uploaded config, which is what omitting them here
+# achieves. The schema itself still accepts them if per-run tuning is worth
+# reintroducing.
+
+# ---------------------------------------------------------------------------
+# Target mode -- "country" (sweeps SWEEP_COUNTRIES below) or "prespecified"
+# (one fixed target-point set, shared by every combo in the sweep; not itself
+# a swept dimension).
+# ---------------------------------------------------------------------------
+TARGET_MODE: str = "country"
+TARGET_POINTS: list[list] = [
+    ["NK: Yongbyon (nuclear)", 39.79, 125.66],
+]
+# If set (and TARGET_MODE == "prespecified"), overrides TARGET_POINTS above by
+# loading a CSV -- see sbi_coverage.core.target_points.load_target_points_csv.
+TARGET_POINTS_CSV: str | Path | None = None
 
 # Per-country inclination sweep bounds — lower bound ≈ minimum latitude of
-# interest for each country, matching sweep_optimize.py.
+# interest for each country, matching sweep_optimize.py. Prespecified mode
+# instead computes its bounds dynamically via smart_inclination_bounds().
 INCLINATION_SWEEP_BOUNDS_DEG: dict[str, tuple[float, float]] = {
     "China":       (20.0, 90.0),
     "North Korea": (35.0, 90.0),
@@ -91,6 +84,14 @@ INCLINATION_SWEEP_BOUNDS_DEG: dict[str, tuple[float, float]] = {
     "Iran":        (20.0, 90.0)
 }
 DEFAULT_INCLINATION_BOUNDS: tuple[float, float] = (0, 90.0)
+
+# ---------------------------------------------------------------------------
+# Run metadata (optional; saved into the output JSON only -- never used for
+# job/config naming, which is unaffected by these). Each combo's saved
+# run_name gets "_<n>" appended, n being its 1-based position in the grid.
+# ---------------------------------------------------------------------------
+RUN_NAME: str | None = None
+IS_PRINCIPAL_SET: bool = False
 
 # ---------------------------------------------------------------------------
 # Sweep grid — mirrors sweep_optimize.py defaults.
@@ -101,6 +102,13 @@ SWEEP_ALTITUDES_KM:             list[float] = [400.0]
 SWEEP_SALVO_SIZES:              list[int]   = [1, 10, 20, 35, 50, 75, 100]
 SWEEP_INTERCEPTORS_PER_SAT:     list[int]   = [1, 2, 4, 6]
 SWEEP_BURNOUT_VELOCITIES_KM_S:  list[float] = [4.0, 5.0, 6.0, 10.0]
+# New sweepable dimensions -- default to a single element (the timing/accel
+# value CoverageConfig would otherwise default to) so an unmodified sweep's
+# grid size is unaffected.
+SWEEP_DETECTION_TIMES_S:        list[float] = [0.0]
+SWEEP_DECISION_TIMES_S:         list[float] = [0.0]
+SWEEP_BURNOUT_TIMES_S:          list[float] = [170.0]
+SWEEP_A_G_LIST:                 list[float] = [10.0]
 # Keyed on r_required = ceil(salvo_size / n_interceptors_per_sat), not on
 # salvo_size directly — the greedy pool must be large enough for the solver
 # to find r_required satellites simultaneously in view of every target, and
@@ -126,22 +134,33 @@ def _sweep_tag(ts: str) -> str:
 
 def _config_for(
     *,
-    country: str,
+    target_mode: str,
+    country: str | None,
+    target_points: list | None,
+    inc_bounds: tuple[float, float],
     altitude_km: float,
     salvo_size: int,
     n_interceptors_per_sat: int,
     v_bo_km_s: float,
+    detection_time_s: float,
+    decision_time_s: float,
+    target_missile_burnout_time_s: float,
+    a_g: float,
     job_name: str,
+    run_name: str | None,
+    is_principal_set: bool,
 ) -> dict:
     """Build the JSON config dict for one batch_worker.py job."""
-    inc_bounds = list(INCLINATION_SWEEP_BOUNDS_DEG.get(country, DEFAULT_INCLINATION_BOUNDS))
     return {
         "job_name":                     job_name,
-        "target_country":               country,
-        "target_shell_n_points":        TARGET_SHELL_N_POINTS,
-        "altitude_override_km":         altitude_km,
-        "inclination_sweep_bounds_deg": inc_bounds,
-        "use_j2":                       USE_J2,
+        "run_name":                     run_name,
+        "is_principal_set":             is_principal_set,
+        "target_mode":                  target_mode,
+        "target_country":               country if target_mode == "country" else None,
+        "target_points":                target_points if target_mode == "prespecified" else None,
+        "target_shell_n_points":        TARGET_SHELL_N_POINTS if target_mode == "country" else None,
+        "target_altitude_km":           altitude_km,
+        "inclination_sweep_bounds_deg": list(inc_bounds),
         "v_bo_km_s":                    v_bo_km_s,
         "salvo_size":                   salvo_size,
         "n_interceptors_per_sat":       n_interceptors_per_sat,
@@ -150,34 +169,45 @@ def _config_for(
         "altitude_max_repeat_days":     ALTITUDE_MAX_REPEAT_DAYS,
         "seeds_for_milp_by_r_required": SEEDS_FOR_MILP_BY_R_REQUIRED,
         "dt_s":                         DT_S,
-        "detection_time_s":             DETECTION_TIME_S,
-        "decision_time_s":              DECISION_TIME_S,
-        "target_missile_burnout_time_s": TARGET_MISSILE_BURNOUT_TIME_S,
-        "a_g":                          A_G,
+        "detection_time_s":             detection_time_s,
+        "decision_time_s":              decision_time_s,
+        "target_missile_burnout_time_s": target_missile_burnout_time_s,
+        "a_g":                          a_g,
         "intercept_alt_km":             INTERCEPT_ALT_KM,
         "min_elev_deg":                 MIN_ELEV_DEG,
         "inc_screen_step_deg":          INC_SCREEN_STEP_DEG,
         "n_raan_offsets":               N_RAAN_OFFSETS,
         "seed_workers":                 SEED_WORKERS,
-        "reserve_polar_orbits":         RESERVE_POLAR_ORBITS,
-        "mip_focus":                    MIP_FOCUS,
-        "heuristics_frac":              HEURISTICS_FRAC,
-        "solver_params":                SOLVER_PARAMS,
     }
 
 
-def _results_exist(s3: "boto3.client", bucket: str, country: str, altitude_km: float,
-                   salvo: int, n_int: int, v_bo: float) -> bool:
+def _results_exist(
+    s3: "boto3.client", bucket: str, *, target_mode: str, country: str | None,
+    target_points: list | None, altitude_km: float, salvo: int, n_int: int, v_bo: float,
+    detection_time_s: float, decision_time_s: float,
+    target_missile_burnout_time_s: float, a_g: float,
+) -> bool:
     """Return True if a .csv result file already exists in S3 for this combination.
 
-    Checks burnout vel, interceptors, salvo, intercept alt, AND orbit altitude.
+    Checks burnout vel, interceptors, salvo, intercept alt, orbit altitude, AND
+    (item 9) the burnout/detection/decision-time and max-accel segments -- once
+    those can vary per combo, omitting them here would falsely treat combos
+    that only differ in one of these as duplicates of each other.
     The snapped orbit altitude may differ slightly from the requested one, so we
     match on a rounded integer (e.g. 'orbit-alt-400km') — sufficient because
     sweep altitudes are spaced further apart than snapping precision.
     """
-    country_slug  = country.lower().replace(" ", "-")
-    intercept_alt = 200   # _INTERCEPT_ALT_KM
-    broad_prefix  = f"country/{country_slug}/"
+    if target_mode == "prespecified":
+        pts = target_points or []
+        first_name = str(pts[0][0]).strip().lower().replace(" ", "-").replace(":", "").replace("/", "-") if pts else "prespecified"
+        broad_prefix = f"prespecified/{first_name[:40]}/"
+    else:
+        country_slug = (country or "").lower().replace(" ", "-")
+        broad_prefix = f"country/{country_slug}/"
+    intercept_alt = round(INTERCEPT_ALT_KM)
+    t_window      = round(target_missile_burnout_time_s)
+    detect_time   = round(detection_time_s)
+    decide_time   = round(decision_time_s)
     paginator = s3.get_paginator("list_objects_v2")
     alt_candidates = {f"orbit-alt-{int(round(altitude_km + d))}km" for d in range(-15, 16)}
     for page in paginator.paginate(Bucket=bucket, Prefix=broad_prefix):
@@ -190,6 +220,10 @@ def _results_exist(s3: "boto3.client", bucket: str, country: str, altitude_km: f
                 and f"interceptors-per-sat-{n_int}/" in key
                 and f"salvo-size-{salvo}/" in key
                 and f"intercept-alt-{intercept_alt}km/" in key
+                and f"intercept-window-{t_window}s/" in key
+                and f"detection-time-{detect_time}s/" in key
+                and f"decision-time-{decide_time}s/" in key
+                and f"max-accel-{a_g:.1f}g/" in key
             ):
                 return True
     return False
@@ -231,22 +265,42 @@ def main(dry_run: bool = False, stagger_seconds: int = 0, stagger_count: int = 1
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
     sweep_tag = _sweep_tag(ts)
 
-    grid = list(itertools.product(
-        SWEEP_COUNTRIES,
-        SWEEP_ALTITUDES_KM,
-        SWEEP_SALVO_SIZES,
-        SWEEP_INTERCEPTORS_PER_SAT,
-        SWEEP_BURNOUT_VELOCITIES_KM_S,
-    ))
+    # Resolve target mode once. Prespecified mode uses ONE fixed target-point
+    # set for the whole sweep (not itself a swept dimension -- there's no
+    # concept elsewhere in this codebase of sweeping over multiple
+    # prespecified sets, and none was requested).
+    if TARGET_MODE == "prespecified":
+        fixed_target_points = load_target_points_csv(TARGET_POINTS_CSV) if TARGET_POINTS_CSV else TARGET_POINTS
+        fixed_inc_bounds = smart_inclination_bounds(fixed_target_points)
+        fixed_target_slug = (
+            str(fixed_target_points[0][0]).strip().lower()
+            .replace(" ", "-").replace(":", "").replace("/", "-")
+        )[:20]
+    else:
+        fixed_target_points = None
+        fixed_inc_bounds = None
+        fixed_target_slug = None
+
+    # Grid as a list of per-combo dicts rather than positional tuples --
+    # "country" only participates as a dimension in country mode, and this
+    # avoids extending an already-wide positional tuple with a conditional slot.
+    dims: dict[str, list] = {}
+    if TARGET_MODE == "country":
+        dims["country"] = SWEEP_COUNTRIES
+    dims.update({
+        "altitude_km":                    SWEEP_ALTITUDES_KM,
+        "salvo_size":                     SWEEP_SALVO_SIZES,
+        "n_interceptors_per_sat":         SWEEP_INTERCEPTORS_PER_SAT,
+        "v_bo_km_s":                      SWEEP_BURNOUT_VELOCITIES_KM_S,
+        "detection_time_s":               SWEEP_DETECTION_TIMES_S,
+        "decision_time_s":                SWEEP_DECISION_TIMES_S,
+        "target_missile_burnout_time_s":  SWEEP_BURNOUT_TIMES_S,
+        "a_g":                            SWEEP_A_G_LIST,
+    })
+    grid = [dict(zip(dims.keys(), values)) for values in itertools.product(*dims.values())]
     n_total = len(grid)
 
-    dim_str = " × ".join(str(len(x)) for x in [
-        SWEEP_COUNTRIES,
-        SWEEP_ALTITUDES_KM,
-        SWEEP_SALVO_SIZES,
-        SWEEP_INTERCEPTORS_PER_SAT,
-        SWEEP_BURNOUT_VELOCITIES_KM_S,
-    ])
+    dim_str = " × ".join(f"{len(v)}" for v in dims.values())
 
     print("=" * 70)
     print("cloud_sweep.py  —  SBI SCLP Cloud Parameter Sweep Launcher")
@@ -273,33 +327,74 @@ def main(dry_run: bool = False, stagger_seconds: int = 0, stagger_count: int = 1
     skipped:   list[dict] = []
     failed:    list[dict] = []
 
-    for idx, (country, alt_km, salvo, n_int, v_bo) in enumerate(grid, 1):
-        country_slug = country.lower().replace(" ", "-")
-        job_name     = (
+    for idx, combo in enumerate(grid, 1):
+        if TARGET_MODE == "country":
+            country       = combo["country"]
+            target_points = None
+            inc_bounds    = INCLINATION_SWEEP_BOUNDS_DEG.get(country, DEFAULT_INCLINATION_BOUNDS)
+            target_slug   = country.lower().replace(" ", "-")
+            target_label  = country
+        else:
+            country       = None
+            target_points = fixed_target_points
+            inc_bounds    = fixed_inc_bounds
+            target_slug   = fixed_target_slug
+            target_label  = fixed_target_slug
+
+        alt_km    = combo["altitude_km"]
+        salvo     = combo["salvo_size"]
+        n_int     = combo["n_interceptors_per_sat"]
+        v_bo      = combo["v_bo_km_s"]
+        detect_s  = combo["detection_time_s"]
+        decide_s  = combo["decision_time_s"]
+        burnout_s = combo["target_missile_burnout_time_s"]
+        a_g_val   = combo["a_g"]
+
+        # Every swept dimension (including the 4 new item-9 ones) must appear
+        # in job_name -- two combos differing only in one of these would
+        # otherwise share an S3 config key, and since Batch jobs run
+        # asynchronously, a later upload can silently clobber an earlier job's
+        # config before its container downloads it.
+        job_name = (
             f"{sweep_tag}"
-            f"_{country_slug}"
+            f"_{target_slug}"
             f"_alt{int(alt_km)}km"
             f"_s{salvo}"
             f"_i{n_int}"
             f"_v{v_bo:.0f}"
+            f"_dt{int(detect_s)}"
+            f"_dc{int(decide_s)}"
+            f"_bt{int(burnout_s)}"
+            f"_ag{a_g_val:.1f}"
         )
         # AWS Batch job names must match [a-zA-Z0-9_-] and be ≤128 chars
         job_name = job_name[:128]
 
+        combo_run_name = f"{RUN_NAME}_{idx}" if RUN_NAME else None
+
         config_key = f"{S3_CONFIG_PREFIX}/{sweep_tag}/{job_name}.json"
         cfg        = _config_for(
+            target_mode=TARGET_MODE,
             country=country,
+            target_points=target_points,
+            inc_bounds=inc_bounds,
             altitude_km=alt_km,
             salvo_size=salvo,
             n_interceptors_per_sat=n_int,
             v_bo_km_s=v_bo,
+            detection_time_s=detect_s,
+            decision_time_s=decide_s,
+            target_missile_burnout_time_s=burnout_s,
+            a_g=a_g_val,
             job_name=job_name,
+            run_name=combo_run_name,
+            is_principal_set=IS_PRINCIPAL_SET,
         )
 
         label = (
-            f"[{idx:3d}/{n_total}]  {country:<12}  "
-            f"alt={alt_km:.0f}km  salvo={salvo:<4}  "
-            f"int/sat={n_int}  v_bo={v_bo:.0f}km/s"
+            f"[{idx:3d}/{n_total}]  {target_label:<12}  "
+            f"alt={alt_km:.0f}km  salvo={salvo:<4}  int/sat={n_int}  v_bo={v_bo:.0f}km/s  "
+            f"detect={detect_s:.0f}s  decide={decide_s:.0f}s  burnout={burnout_s:.0f}s  a_g={a_g_val:.1f}"
         )
 
         if dry_run:
@@ -309,7 +404,13 @@ def main(dry_run: bool = False, stagger_seconds: int = 0, stagger_count: int = 1
             continue
 
         # Check if results already exist in S3 — skip if so
-        if _results_exist(s3, S3_BUCKET, country, alt_km, salvo, n_int, v_bo):
+        if _results_exist(
+            s3, S3_BUCKET,
+            target_mode=TARGET_MODE, country=country, target_points=target_points,
+            altitude_km=alt_km, salvo=salvo, n_int=n_int, v_bo=v_bo,
+            detection_time_s=detect_s, decision_time_s=decide_s,
+            target_missile_burnout_time_s=burnout_s, a_g=a_g_val,
+        ):
             print(f"  SKIP {label}  (results already in S3)")
             skipped.append({"job_name": job_name, "reason": "results already in S3"})
             continue
