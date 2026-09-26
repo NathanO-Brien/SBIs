@@ -1018,9 +1018,11 @@ def main() -> None:
         "polar_band_deg":                 list(POLAR_BAND_DEG),
         "polar_band_divisor":             POLAR_BAND_DIVISOR,
         "n_seeds_built":                  int(n_built),
+        "n_seeds_trimmed":                int(n_trimmed),
         "n_seeds_after_trim":             int(n_selected),
         "build_worst_margin":             build_worst_margin,
         "trim_worst_margin":              trim_worst_margin,
+        "bilp_n_vars":                    int(n_selected * L),
         "reserve_polar_orbits":           RESERVE_POLAR_ORBITS,
         "polar_reservation_inclinations": list(_POLAR_RESERVATION_INCLINATIONS) if RESERVE_POLAR_ORBITS else [],
         "seeds_selected": [
