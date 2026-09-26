@@ -45,8 +45,6 @@ from sbi_coverage.Lee import (
     build_orb_elems_table,
     build_param_V,
     candidate_rgt_ratios,
-    footprint_half_angles_deg,
-    optimal_sat_altitude_km,
     param_V_summary,
     print_orb_table,
     rgt_common_ground_track_layer,
@@ -60,7 +58,6 @@ from sbi_coverage.Lee import (
 # Edit lee_test2.py first, then mirror changes here.
 # ---------------------------------------------------------------------------
 TARGET_MODE: str                                  = "country"
-USE_J2: bool                                       = False
 USE_DRAG: bool                                     = False
 TARGET_SHELL_N_POINTS: int                        = 15000
 # Target temporal resolution — determines L = round(T_r / DT_S) slots per repeat
@@ -105,33 +102,23 @@ SEEDS_FOR_MILP_BY_R_REQUIRED: dict[int, int] = {
     50: 100,   # r_required 50 → 100 seeds
     100: 150,  # r_required 100 → 150 seeds
 }
-RESERVE_POLAR_ORBITS: bool                        = False
-MIP_FOCUS: int                                    = 1
-HEURISTICS_FRAC: float                            = 0.2
-# Additional Gurobi parameter overrides — applied after MIP_FOCUS / HEURISTICS_FRAC.
-# Note: CoverCuts=2, Cuts=2, and LPWarmStart=1 are already hardcoded in the solver.
-SOLVER_PARAMS: dict = {
-    # Method 1 = dual simplex. Previously Method 2 (Barrier) — barrier took 300s+ on root LP
-    # and crossover added another 70s. For pure 0/1 set-cover with an all-ones matrix,
-    # dual simplex is faster because the matrix is sparse and simplex exploits that.
-    "Method":                1,
-    # Write B&B nodes to disk at 4 GB — prevents OOM during branching.
-    "NodefileStart":         4,
-    # RINS heuristic every 50 nodes — this is what actually finds good solutions.
-    # B&B alone cannot explore enough nodes on problems of this size.
-    "RINS":                  50,
-    # Presolve removed 0 rows and 0 columns in testing (pure 0/1 set-cover gives it
-    # nothing to exploit) while consuming 268s. Disabled.
-    # Previously: "Presolve": 2
-    # No-improvement termination: stop if no incumbent improvement for 1 hour,
-    # but don't start that clock until 3 hours in — gives RINS time to find its
-    # first solution on hard instances before the termination check activates.
-    # Previously used a fixed TimeLimit only, which wasted hours on a stalled solver.
-}
+# mip_focus/heuristics_frac/solver_params are intentionally not overridden
+# here -- solve_sclp() now defaults to vanilla Gurobi tuning (MIPFocus=0,
+# Heuristics=0.05, no solver_params overrides). The architecture to
+# specialize these per-run is still in solve_sclp()'s signature; pass them
+# explicitly again here if/when that's worth re-enabling.
 LOG_DIR: Path | None                              = Path("logFiles")
 RESULTS_DIR: Path                                 = Path("results")
 
 PROPAGATOR: str = "Nominal_Propagator"
+
+# ---------------------------------------------------------------------------
+# Run metadata (optional; saved into the output JSON only -- never used for
+# file/folder naming, which is unaffected by these). For a sweep, each run's
+# saved run_name gets "_<n>" appended, n being its 1-based position in grid.
+# ---------------------------------------------------------------------------
+RUN_NAME: str | None = None
+IS_PRINCIPAL_SET: bool = False
 
 # ---------------------------------------------------------------------------
 # Sweep grid — China runs execute before North Korea runs.
@@ -141,6 +128,12 @@ SWEEP_ALTITUDES_KM: list[float]            = [250.0, 550.0]
 SWEEP_SALVO_SIZES: list[int]               = [1, 10, 20, 50, 100]
 SWEEP_INTERCEPTORS_PER_SAT: list[int]      = [1, 2, 4, 6]
 SWEEP_BURNOUT_VELOCITIES_KM_S: list[float] = [4.0, 5.0, 6.0, 10.0]
+# New sweepable dimensions -- default to a single element (the corresponding
+# fixed value above) so an unmodified sweep's grid size is unaffected.
+SWEEP_DETECTION_TIMES_S: list[float]              = [DETECTION_TIME_S]
+SWEEP_DECISION_TIMES_S: list[float]               = [DECISION_TIME_S]
+SWEEP_BURNOUT_TIMES_S: list[float]                = [TARGET_MISSILE_BURNOUT_TIME_S]
+SWEEP_A_G_LIST: list[float]                       = [A_G]
 
 # Per-run solver budget
 SWEEP_TIME_LIMIT_S: float      = 7200.0   # wall time stop (normal runs)
@@ -150,11 +143,6 @@ SWEEP_MIP_GAP: float           = 0.01     # 1% — stop early if gap reaches thi
 
 # One-line-per-run JSON progress log
 SWEEP_PROGRESS_FILE: Path = RESULTS_DIR / "sweep_progress.jsonl"
-
-# ---------------------------------------------------------------------------
-# Polar reservation inclinations — mirrors lee_test2.py
-# ---------------------------------------------------------------------------
-_POLAR_RESERVATION_INCLINATIONS: tuple[float, ...] = (80.0, 85.0, 90.0)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +179,26 @@ def _seeds_for_r_required(r_required: int) -> int:
 # Progress tracking
 # ---------------------------------------------------------------------------
 
+def _run_key_from_entry(entry: dict) -> tuple:
+    """Build the 9-field dedup key for a progress-log entry.
+
+    The 4 new dims (detection/decision/burnout time, a_g) default to the
+    current fixed constants when absent, so log lines written before these
+    dims existed still match today's single-element-list sweeps exactly.
+    """
+    return (
+        str(entry["country"]),
+        float(entry["altitude_km"]),
+        int(entry["salvo_size"]),
+        int(entry["n_interceptors_per_sat"]),
+        float(entry["v_bo_km_s"]),
+        float(entry.get("detection_time_s", DETECTION_TIME_S)),
+        float(entry.get("decision_time_s", DECISION_TIME_S)),
+        float(entry.get("target_missile_burnout_time_s", TARGET_MISSILE_BURNOUT_TIME_S)),
+        float(entry.get("a_g", A_G)),
+    )
+
+
 def _load_completed_keys() -> set[tuple]:
     """
     Return the set of run keys already recorded as 'completed', 'infeasible',
@@ -212,13 +220,7 @@ def _load_completed_keys() -> set[tuple]:
                 continue
             if entry.get("outcome") in ("completed", "infeasible", "no_incumbent"):
                 try:
-                    done.add((
-                        str(entry["country"]),
-                        float(entry["altitude_km"]),
-                        int(entry["salvo_size"]),
-                        int(entry["n_interceptors_per_sat"]),
-                        float(entry["v_bo_km_s"]),
-                    ))
+                    done.add(_run_key_from_entry(entry))
                 except KeyError:
                     pass
     return done
@@ -260,13 +262,7 @@ def _find_100pct_gap_runs() -> list[dict]:
             if entry.get("outcome") != "completed":
                 continue
             try:
-                key = (
-                    str(entry["country"]),
-                    float(entry["altitude_km"]),
-                    int(entry["salvo_size"]),
-                    int(entry["n_interceptors_per_sat"]),
-                    float(entry["v_bo_km_s"]),
-                )
+                key = _run_key_from_entry(entry)
             except KeyError:
                 continue
             latest[key] = entry  # last completed entry for this key wins
@@ -298,23 +294,18 @@ def _greedy_select_seeds(
     n_max: int,
     *,
     inc_deg_list: list[float] | None = None,
-    reserve_polar_orbits: bool = False,
 ) -> list[int]:
     """Greedy marginal-coverage seed selection (mirrors lee_test2.py exactly).
 
-    Three-phase selection:
-
-    Phase 0 — Polar reservation (if reserve_polar_orbits is True):
-        Pre-select the best-RAAN seed for each inclination in
-        _POLAR_RESERVATION_INCLINATIONS before any other selection runs.
+    Two-phase selection:
 
     Phase 1 — Inclination guarantee:
-        Every discrete inclination value present in inc_deg_list that was not
-        already covered by Phase 0 is guaranteed exactly one representative.
-        Among all RAAN candidates for a given inclination the one with the
-        highest marginal-coverage score is chosen.  Inclinations are processed
-        in greedy order — whichever missing inclination's best candidate
-        contributes the most marginal coverage is selected first.
+        Every discrete inclination value present in inc_deg_list is
+        guaranteed exactly one representative. Among all RAAN candidates for
+        a given inclination the one with the highest marginal-coverage score
+        is chosen.  Inclinations are processed in greedy order — whichever
+        missing inclination's best candidate contributes the most marginal
+        coverage is selected first.
 
     Phase 2 — Greedy fill:
         Remaining n_max slots are filled by standard greedy marginal-coverage,
@@ -325,24 +316,6 @@ def _greedy_select_seeds(
     deficit   = np.full(access.shape[1], float(r_required))
     selected: list[int] = []
     remaining = list(range(n_seeds))
-
-    # ------------------------------------------------------------------
-    # Phase 0: Polar reservation
-    # ------------------------------------------------------------------
-    if reserve_polar_orbits and inc_deg_list is not None and n_max >= 1:
-        for target_inc in _POLAR_RESERVATION_INCLINATIONS:
-            if len(selected) >= n_max:
-                break
-            candidates = [
-                i for i in remaining
-                if abs(inc_deg_list[i] - target_inc) < 0.1
-            ]
-            if not candidates:
-                continue
-            best = max(candidates, key=lambda i: access[i].sum())
-            selected.append(best)
-            deficit = np.maximum(0.0, deficit - access[best])
-            remaining.remove(best)
 
     # ------------------------------------------------------------------
     # Phase 1: Inclination guarantee — every unique inclination gets one rep
@@ -410,8 +383,20 @@ def _result_subdir_for(
     actual_alt_km: float,
     n_interceptors_per_sat: int,
     salvo_size: int,
+    *,
+    detection_time_s: float,
+    decision_time_s: float,
+    target_missile_burnout_time_s: float,
+    a_g: float,
 ) -> Path:
-    """Build and create the hierarchical results subfolder for one sweep run."""
+    """Build and create the hierarchical results subfolder for one sweep run.
+
+    detection_time_s/decision_time_s/target_missile_burnout_time_s/a_g are
+    taken as parameters (not read from the module constants) because they can
+    now vary per combo (item 9's new sweep dimensions) -- reading the module
+    constants directly here would label every combo's folder with the same
+    stale value regardless of which one was actually used.
+    """
     target_slug = country.lower().replace(" ", "-")
     path = (
         RESULTS_DIR / target_slug
@@ -420,10 +405,14 @@ def _result_subdir_for(
         # path-parsing regexes (cloud_plot_best_results.py,
         # plot_best_results_by_country.py) keep matching -- only the source
         # of the number changed, from T_WINDOW_S to
-        # TARGET_MISSILE_BURNOUT_TIME_S (numerically identical at defaults).
-        / f"intercept-window-{TARGET_MISSILE_BURNOUT_TIME_S:.0f}s"
+        # target_missile_burnout_time_s (numerically identical at defaults).
+        / f"intercept-window-{target_missile_burnout_time_s:.0f}s"
+        # New segments for the other two timing dims -- these have no legacy
+        # path convention to preserve, so they're named directly.
+        / f"detection-time-{detection_time_s:.0f}s"
+        / f"decision-time-{decision_time_s:.0f}s"
         / f"intercept-alt-{INTERCEPT_ALT_KM:.0f}km"
-        / f"max-accel-{A_G:.1f}g"
+        / f"max-accel-{a_g:.1f}g"
         / f"orbit-alt-{round(actual_alt_km)}km"
         / f"interceptors-per-sat-{n_interceptors_per_sat}"
         / f"salvo-size-{salvo_size}"
@@ -439,12 +428,18 @@ def _result_subdir_for(
 def run_single(
     *,
     country: str,
-    altitude_override_km: float,
+    target_altitude_km: float,
     salvo_size: int,
     n_interceptors_per_sat: int,
     v_bo_km_s: float,
     inclination_sweep_bounds_deg: tuple[float, float],
+    detection_time_s: float = DETECTION_TIME_S,
+    decision_time_s: float = DECISION_TIME_S,
+    target_missile_burnout_time_s: float = TARGET_MISSILE_BURNOUT_TIME_S,
+    a_g: float = A_G,
     time_limit_s: float = SWEEP_TIME_LIMIT_S,
+    run_name: str | None = None,
+    is_principal_set: bool = False,
 ) -> dict:
     """
     Execute one full SCLP optimization for the given parameter combination.
@@ -463,44 +458,28 @@ def run_single(
     # ------------------------------------------------------------------
     cov = CoverageConfig(
         earth=earth,
-        detection_time_s=DETECTION_TIME_S,
-        decision_time_s=DECISION_TIME_S,
-        target_missile_burnout_time_s=TARGET_MISSILE_BURNOUT_TIME_S,
+        detection_time_s=detection_time_s,
+        decision_time_s=decision_time_s,
+        target_missile_burnout_time_s=target_missile_burnout_time_s,
         v_bo_km_s=v_bo_km_s,
-        a_g=A_G,
+        a_g=a_g,
         intercept_alt_km=INTERCEPT_ALT_KM,
         min_elev_deg=MIN_ELEV_DEG,
     )
     print(f"Computed R_max: {cov.max_range_km:.2f} km")
 
-    h_star = optimal_sat_altitude_km(
-        max_range_km=cov.max_range_km,
-        min_elev_deg=cov.min_elev_deg,
-        intercept_alt_km=cov.intercept_alt_km,
-        earth=earth,
-    )
-    angles = footprint_half_angles_deg(
-        h_sat_km=h_star,
-        max_range_km=cov.max_range_km,
-        min_elev_deg=cov.min_elev_deg,
-        intercept_alt_km=cov.intercept_alt_km,
-        earth=earth,
-    )
-    print(f"Optimal satellite altitude (h*): {h_star:.2f} km")
-    print(f"  rho_eff: {angles['rho_eff_deg']:.4f} deg  (binding: {angles['binding']})")
-
     # ------------------------------------------------------------------
     # Snap to nearest RGT orbit at the requested altitude
     # ------------------------------------------------------------------
     candidates = candidate_rgt_ratios(
-        h_star_km=altitude_override_km,
+        h_star_km=target_altitude_km,
         earth=earth,
         max_repeat_days=ALTITUDE_MAX_REPEAT_DAYS,
         dt_s=DT_S,
     )
     if not candidates:
         raise ValueError(
-            f"No RGT orbit found near {altitude_override_km:.0f} km "
+            f"No RGT orbit found near {target_altitude_km:.0f} km "
             f"with N_D ≤ {ALTITUDE_MAX_REPEAT_DAYS}.  "
             "Raise ALTITUDE_MAX_REPEAT_DAYS or choose a different altitude."
         )
@@ -509,23 +488,11 @@ def run_single(
     N_P           = int(best["N_P"])
     L             = int(best["L"])
     actual_alt_km = float(best["alt_km"])
-
-    if USE_J2:
-        from sbi_coverage.Lee.rgt_slots import a_km_j2_rgt as _a_km_j2_rgt
-        _inc_ref     = float(np.mean(inclination_sweep_bounds_deg))
-        _a_j2        = _a_km_j2_rgt(N_P, N_D, _inc_ref, earth)
-        _n_j2        = float(np.sqrt(earth.mu_km3_s2 / _a_j2**3))
-        _fac_j2      = 1.5 * earth.j2 * (earth.r_eq_km / _a_j2)**2 * _n_j2
-        _od_j2       = 0.5 * _fac_j2 * (5.0 * np.cos(np.deg2rad(_inc_ref))**2 - 1.0)
-        _T_r_j2      = N_P * 2.0 * np.pi / (_n_j2 + _od_j2)
-        L            = round(_T_r_j2 / DT_S)
-        dt_s_actual  = _T_r_j2 / L
-    else:
-        dt_s_actual  = float(best["T_r_s"]) / L
+    dt_s_actual   = float(best["T_r_s"]) / L
 
     horizon_s     = (L - 1) * dt_s_actual
     print(
-        f"\nAltitude OVERRIDE requested: {altitude_override_km:.1f} km  →  "
+        f"\nTarget altitude requested: {target_altitude_km:.1f} km  →  "
         f"nearest RGT orbit: {N_P}:{N_D}  "
         f"actual_alt={actual_alt_km:.2f} km  "
         f"(snap error: {float(best['alt_error_km']):.2f} km)"
@@ -535,13 +502,12 @@ def run_single(
         horizon_s=horizon_s,
         dt_s=dt_s_actual,
         analysis_matrix_dtype="uint8",
-        use_j2=USE_J2,
+        use_j2=False,
         use_drag=USE_DRAG,
     )
     print(f"Shared repeat family: N_D={N_D}  L={L} steps")
     print(f"Simulation horizon: {horizon_s:.1f} s  ({horizon_s / 3600:.3f} h)  -> L={L}")
-    _tr_label = "J2-corrected T_r/L" if USE_J2 else "Keplerian T_r/L"
-    print(f"dt_s: {DT_S:.4f} s (nominal) → {dt_s_actual:.6f} s ({_tr_label})")
+    print(f"dt_s: {DT_S:.4f} s (nominal) → {dt_s_actual:.6f} s (Keplerian T_r/L)")
 
     # ------------------------------------------------------------------
     # Build country target shell
@@ -574,9 +540,6 @@ def run_single(
         float(inc_hi) + float(INCLINATION_SCREEN_STEP_DEG) * 0.5,
         float(INCLINATION_SCREEN_STEP_DEG),
     )
-    if RESERVE_POLAR_ORBITS:
-        polar_extra = np.array(list(_POLAR_RESERVATION_INCLINATIONS), dtype=np.float64)
-        inc_grid    = np.unique(np.concatenate([inc_grid, polar_extra]))
 
     raan_interval = 360.0 / N_P
     raan_grid     = np.linspace(0.0, raan_interval, N_RAAN_OFFSETS, endpoint=False)
@@ -587,8 +550,6 @@ def run_single(
     # ------------------------------------------------------------------
     # Build sub-layers
     # ------------------------------------------------------------------
-    _a_km_ref  = _a_j2        if sim.use_j2 else None
-    _dt_s_slot = dt_s_actual  if sim.use_j2 else None
     sub_layers = [
         rgt_common_ground_track_layer(
             inc_deg=inc,
@@ -597,9 +558,7 @@ def run_single(
             L=L,
             earth=earth,
             raan0_deg=raan,
-            use_j2=sim.use_j2,
-            a_km_override=_a_km_ref,
-            dt_s=_dt_s_slot,
+            use_j2=False,
         )
         for inc, raan in seed_pairs
     ]
@@ -662,7 +621,6 @@ def run_single(
     greedy_idx   = _greedy_select_seeds(
         v0_list, r_required, n_seeds_for_milp,
         inc_deg_list=inc_deg_list,
-        reserve_polar_orbits=RESERVE_POLAR_ORBITS,
     )
     n_selected = len(greedy_idx)
     print(f"\nGreedy seed selection: {n_selected} of {n_seeds} live seeds → MILP")
@@ -678,35 +636,18 @@ def run_single(
         + ("✓ feasible" if feasible_proxy else "⚠ may be infeasible — consider raising SEEDS_FOR_MILP_BY_R_REQUIRED")
     )
 
-    # Tag seeds by selection phase: polar-reserved, inc-guaranteed, or greedy fill.
-    polar_reserved_set: dict[int, float] = {}
-    if RESERVE_POLAR_ORBITS and inc_deg_list:
-        for idx in greedy_idx:
-            inc_val = inc_deg_list[idx]
-            for target_inc in _POLAR_RESERVATION_INCLINATIONS:
-                if abs(inc_val - target_inc) < 0.1 and target_inc not in polar_reserved_set.values():
-                    polar_reserved_set[idx] = target_inc
-                    break
-            if len(polar_reserved_set) >= len(_POLAR_RESERVATION_INCLINATIONS):
-                break
+    # Tag seeds by selection phase: inc-guaranteed, or greedy fill.
     inc_guaranteed_set: set[int] = set()
     if inc_deg_list:
-        _seen_incs: set[float] = {inc_deg_list[i] for i in polar_reserved_set}
+        _seen_incs: set[float] = set()
         for idx in greedy_idx:
-            if idx in polar_reserved_set:
-                continue
             _inc_val = inc_deg_list[idx]
             if _inc_val not in _seen_incs:
                 inc_guaranteed_set.add(idx)
                 _seen_incs.add(_inc_val)
     for rank, idx in enumerate(greedy_idx):
         inc, raan = seed_pairs[idx]
-        if idx in polar_reserved_set:
-            tag = f"  [polar reserved {polar_reserved_set[idx]:.0f}°]"
-        elif idx in inc_guaranteed_set:
-            tag = "  [inc. guaranteed]"
-        else:
-            tag = ""
+        tag = "  [inc. guaranteed]" if idx in inc_guaranteed_set else ""
         print(
             f"  {rank + 1:2d}: i={inc:5.1f}°  RAAN={raan:6.1f}°  "
             f"access/target={v0_list[idx].sum(axis=0).mean():.1f}{tag}"
@@ -751,9 +692,6 @@ def run_single(
         time_limit_s=time_limit_s,
         log_file=log_file,
         verbose=True,
-        mip_focus=MIP_FOCUS,
-        heuristics_frac=HEURISTICS_FRAC,
-        solver_params=SOLVER_PARAMS,
     )
 
     print("\n" + "=" * 60)
@@ -806,10 +744,17 @@ def run_single(
     orb_elems = build_orb_elems_table(sub_layers_milp, L)
     print_orb_table(orb_elems, result.selected_slots)
 
-    out_dir  = _result_subdir_for(country, v_bo_km_s, actual_alt_km, n_interceptors_per_sat, salvo_size)
+    out_dir  = _result_subdir_for(
+        country, v_bo_km_s, actual_alt_km, n_interceptors_per_sat, salvo_size,
+        detection_time_s=detection_time_s, decision_time_s=decision_time_s,
+        target_missile_burnout_time_s=target_missile_burnout_time_s, a_g=a_g,
+    )
     csv_path = out_dir / f"{ts}_result.csv"
 
     run_config = {
+        # --- Run metadata ---
+        "run_name":                       run_name,
+        "is_principal_set":               is_principal_set,
         # --- Target ---
         "target_mode":                    TARGET_MODE,
         "target_country":                 country,
@@ -818,19 +763,18 @@ def run_single(
         # --- Engagement physics ---
         "dt_s":                           dt_s_actual,
         "dt_s_nominal":                   DT_S,
-        "detection_time_s":               DETECTION_TIME_S,
-        "decision_time_s":                DECISION_TIME_S,
-        "target_missile_burnout_time_s":  TARGET_MISSILE_BURNOUT_TIME_S,
+        "detection_time_s":               detection_time_s,
+        "decision_time_s":                decision_time_s,
+        "target_missile_burnout_time_s":  target_missile_burnout_time_s,
         "interceptor_engagement_time_s":  float(cov.interceptor_engagement_time_s),
         "v_bo_km_s":                      v_bo_km_s,
-        "a_g":                            A_G,
+        "a_g":                            a_g,
         "intercept_alt_km":               INTERCEPT_ALT_KM,
         "min_elev_deg":                   MIN_ELEV_DEG,
         "r_max_km":                       float(cov.max_range_km),
         # --- Orbit ---
-        "altitude_override_km":           altitude_override_km,
+        "target_altitude_km":             target_altitude_km,
         "altitude_max_repeat_days":       ALTITUDE_MAX_REPEAT_DAYS,
-        "h_star_km":                      float(h_star),
         "actual_alt_km":                  float(actual_alt_km),
         "rgt_ratio":                      f"{N_P}:{N_D}",
         "L":                              int(L),
@@ -844,8 +788,6 @@ def run_single(
         "n_seeds_simulated":              int(n_seeds_total),
         "n_seeds_live":                   int(n_seeds_live),
         "n_seeds_for_milp":               n_seeds_for_milp,
-        "reserve_polar_orbits":           RESERVE_POLAR_ORBITS,
-        "polar_reservation_inclinations": list(_POLAR_RESERVATION_INCLINATIONS) if RESERVE_POLAR_ORBITS else [],
         "seeds_selected": [
             {
                 "rank":     rank + 1,
@@ -861,8 +803,6 @@ def run_single(
         # --- Solver ---
         "mip_gap_target":                 SWEEP_MIP_GAP,
         "time_limit_s":                   time_limit_s,
-        "mip_focus":                      MIP_FOCUS,
-        "heuristics_frac":                HEURISTICS_FRAC,
         # --- Result summary ---
         "timestamp_utc":                  datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "result_status":                  result.status_str,
@@ -917,6 +857,10 @@ def main() -> None:
         SWEEP_SALVO_SIZES,
         SWEEP_INTERCEPTORS_PER_SAT,
         SWEEP_BURNOUT_VELOCITIES_KM_S,
+        SWEEP_DETECTION_TIMES_S,
+        SWEEP_DECISION_TIMES_S,
+        SWEEP_BURNOUT_TIMES_S,
+        SWEEP_A_G_LIST,
     ))
     n_total = len(grid)
 
@@ -931,27 +875,42 @@ def main() -> None:
               f"(was {SWEEP_TIME_LIMIT_S / 3600:.0f} h)")
         print("=" * 70)
         for rerun_entry in reruns:
-            r_country = str(rerun_entry["country"])
-            r_alt     = float(rerun_entry["altitude_km"])
-            r_salvo   = int(rerun_entry["salvo_size"])
-            r_n_int   = int(rerun_entry["n_interceptors_per_sat"])
-            r_vbo     = float(rerun_entry["v_bo_km_s"])
+            r_country  = str(rerun_entry["country"])
+            r_alt      = float(rerun_entry["altitude_km"])
+            r_salvo    = int(rerun_entry["salvo_size"])
+            r_n_int    = int(rerun_entry["n_interceptors_per_sat"])
+            r_vbo      = float(rerun_entry["v_bo_km_s"])
+            # New dims default to the current fixed constants for log entries
+            # written before these dims existed (see _run_key_from_entry).
+            r_detect   = float(rerun_entry.get("detection_time_s", DETECTION_TIME_S))
+            r_decide   = float(rerun_entry.get("decision_time_s", DECISION_TIME_S))
+            r_burnout  = float(rerun_entry.get("target_missile_burnout_time_s", TARGET_MISSILE_BURNOUT_TIME_S))
+            r_a_g      = float(rerun_entry.get("a_g", A_G))
+            r_combo    = (r_country, r_alt, r_salvo, r_n_int, r_vbo, r_detect, r_decide, r_burnout, r_a_g)
+            r_run_name = f"{RUN_NAME}_{grid.index(r_combo) + 1}" if RUN_NAME and r_combo in grid else RUN_NAME
             print(
                 f"\n[Phase 0]  {r_country}  alt={r_alt:.0f} km  "
-                f"salvo={r_salvo}  int/sat={r_n_int}  v_bo={r_vbo:.1f} km/s"
+                f"salvo={r_salvo}  int/sat={r_n_int}  v_bo={r_vbo:.1f} km/s  "
+                f"detect={r_detect:.0f}s  decide={r_decide:.0f}s  burnout={r_burnout:.0f}s  a_g={r_a_g:.1f}"
             )
             t_run0 = time.perf_counter()
             try:
                 summary  = run_single(
                     country=r_country,
-                    altitude_override_km=r_alt,
+                    target_altitude_km=r_alt,
                     salvo_size=r_salvo,
                     n_interceptors_per_sat=r_n_int,
                     v_bo_km_s=r_vbo,
                     inclination_sweep_bounds_deg=INCLINATION_SWEEP_BOUNDS_DEG.get(
                         r_country, (20.0, 90.0)
                     ),
+                    detection_time_s=r_detect,
+                    decision_time_s=r_decide,
+                    target_missile_burnout_time_s=r_burnout,
+                    a_g=r_a_g,
                     time_limit_s=RETRY_TIME_LIMIT_S,
+                    run_name=r_run_name,
+                    is_principal_set=IS_PRINCIPAL_SET,
                 )
                 wall_s       = time.perf_counter() - t_run0
                 outcome      = summary["outcome"]
@@ -965,6 +924,10 @@ def main() -> None:
                     "salvo_size":             r_salvo,
                     "n_interceptors_per_sat": r_n_int,
                     "v_bo_km_s":              r_vbo,
+                    "detection_time_s":       r_detect,
+                    "decision_time_s":        r_decide,
+                    "target_missile_burnout_time_s": r_burnout,
+                    "a_g":                    r_a_g,
                     "actual_alt_km":          summary.get("actual_alt_km"),
                     "n_satellites":           summary.get("n_satellites"),
                     "obj_bound":              summary.get("obj_bound"),
@@ -996,6 +959,10 @@ def main() -> None:
                     "salvo_size":             r_salvo,
                     "n_interceptors_per_sat": r_n_int,
                     "v_bo_km_s":              r_vbo,
+                    "detection_time_s":       r_detect,
+                    "decision_time_s":        r_decide,
+                    "target_missile_burnout_time_s": r_burnout,
+                    "a_g":                    r_a_g,
                     "error":                  str(exc),
                     "time_limit_s_used":      RETRY_TIME_LIMIT_S,
                     "wall_time_s":            round(wall_s, 1),
@@ -1006,17 +973,14 @@ def main() -> None:
 
     # Reload after Phase 0 so the main sweep sees retry outcomes as completed.
     completed_keys = _load_completed_keys()
-    n_already_done = sum(
-        1 for (country, alt, salvo, n_int, v_bo) in grid
-        if (country, float(alt), int(salvo), int(n_int), float(v_bo)) in completed_keys
-    )
+    n_already_done = sum(1 for combo in grid if combo in completed_keys)
     n_remaining = n_total - n_already_done
 
     print("=" * 70)
     print("sweep_optimize.py  —  SBI SCLP Parameter Sweep")
     print("=" * 70)
     print(f"  Combinations       : {n_total}  "
-          f"({' × '.join(str(len(x)) for x in [SWEEP_COUNTRIES, SWEEP_ALTITUDES_KM, SWEEP_SALVO_SIZES, SWEEP_INTERCEPTORS_PER_SAT, SWEEP_BURNOUT_VELOCITIES_KM_S])})")
+          f"({' × '.join(str(len(x)) for x in [SWEEP_COUNTRIES, SWEEP_ALTITUDES_KM, SWEEP_SALVO_SIZES, SWEEP_INTERCEPTORS_PER_SAT, SWEEP_BURNOUT_VELOCITIES_KM_S, SWEEP_DETECTION_TIMES_S, SWEEP_DECISION_TIMES_S, SWEEP_BURNOUT_TIMES_S, SWEEP_A_G_LIST])})")
     print(f"  Already completed  : {n_already_done}")
     print(f"  Remaining          : {n_remaining}")
     print(f"  Time budget / run  : {SWEEP_TIME_LIMIT_S / 60:.0f} min  OR  MIP gap ≤ {SWEEP_MIP_GAP * 100:.1f}%")
@@ -1025,20 +989,24 @@ def main() -> None:
     print(f"  Progress log       : {SWEEP_PROGRESS_FILE}")
     print("=" * 70)
 
-    for combo_idx, (country, alt_km, salvo, n_int, v_bo) in enumerate(grid, 1):
-        key = (country, float(alt_km), int(salvo), int(n_int), float(v_bo))
+    for combo_idx, (country, alt_km, salvo, n_int, v_bo, detect_s, decide_s, burnout_s, a_g_val) in enumerate(grid, 1):
+        key = (country, float(alt_km), int(salvo), int(n_int), float(v_bo),
+               float(detect_s), float(decide_s), float(burnout_s), float(a_g_val))
+        combo_run_name = f"{RUN_NAME}_{combo_idx}" if RUN_NAME else None
 
         if key in completed_keys:
             print(
                 f"\n[{combo_idx:3d}/{n_total}] SKIP  {country}  "
-                f"alt={alt_km:.0f}km  salvo={salvo}  int/sat={n_int}  v_bo={v_bo:.0f}km/s"
+                f"alt={alt_km:.0f}km  salvo={salvo}  int/sat={n_int}  v_bo={v_bo:.0f}km/s  "
+                f"detect={detect_s:.0f}s  decide={decide_s:.0f}s  burnout={burnout_s:.0f}s  a_g={a_g_val:.1f}"
             )
             continue
 
         print(f"\n{'=' * 70}")
         print(
             f"[{combo_idx:3d}/{n_total}]  {country}  alt={alt_km:.0f}km  "
-            f"salvo={salvo}  int/sat={n_int}  v_bo={v_bo:.0f}km/s"
+            f"salvo={salvo}  int/sat={n_int}  v_bo={v_bo:.0f}km/s  "
+            f"detect={detect_s:.0f}s  decide={decide_s:.0f}s  burnout={burnout_s:.0f}s  a_g={a_g_val:.1f}"
         )
         print(f"{'=' * 70}")
 
@@ -1046,14 +1014,20 @@ def main() -> None:
         try:
             summary = run_single(
                 country=country,
-                altitude_override_km=float(alt_km),
+                target_altitude_km=float(alt_km),
                 salvo_size=int(salvo),
                 n_interceptors_per_sat=int(n_int),
                 v_bo_km_s=float(v_bo),
                 inclination_sweep_bounds_deg=INCLINATION_SWEEP_BOUNDS_DEG.get(
                     country, (20.0, 90.0)
                 ),
+                detection_time_s=float(detect_s),
+                decision_time_s=float(decide_s),
+                target_missile_burnout_time_s=float(burnout_s),
+                a_g=float(a_g_val),
                 time_limit_s=SWEEP_TIME_LIMIT_S,
+                run_name=combo_run_name,
+                is_principal_set=IS_PRINCIPAL_SET,
             )
             wall_s  = time.perf_counter() - t_run0
             outcome = summary["outcome"]
@@ -1068,6 +1042,10 @@ def main() -> None:
                 "salvo_size":             salvo,
                 "n_interceptors_per_sat": n_int,
                 "v_bo_km_s":              v_bo,
+                "detection_time_s":       detect_s,
+                "decision_time_s":        decide_s,
+                "target_missile_burnout_time_s": burnout_s,
+                "a_g":                    a_g_val,
                 "actual_alt_km":          summary.get("actual_alt_km"),
                 "n_satellites":           summary.get("n_satellites"),
                 "obj_bound":              summary.get("obj_bound"),
@@ -1100,6 +1078,10 @@ def main() -> None:
                 "salvo_size":             salvo,
                 "n_interceptors_per_sat": n_int,
                 "v_bo_km_s":              v_bo,
+                "detection_time_s":       detect_s,
+                "decision_time_s":        decide_s,
+                "target_missile_burnout_time_s": burnout_s,
+                "a_g":                    a_g_val,
                 "error":                  str(exc),
                 "wall_time_s":            round(wall_s, 1),
                 "timestamp_utc":          datetime.datetime.now(datetime.timezone.utc).isoformat(),
