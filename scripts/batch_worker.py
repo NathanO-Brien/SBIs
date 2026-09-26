@@ -3,10 +3,10 @@ batch_worker.py
 
 Cloud-native SCLP optimization script for AWS Batch.
 
-Mirrors lee_test2.py exactly — country-mode target shell, full inclination ×
-RAAN seed grid, greedy seed selection, polar orbit reservation — but reads all
-problem inputs from a JSON config file stored in S3 and writes all outputs back
-to S3.  Designed to run inside a Docker container on AWS Batch.
+Mirrors lee_test2.py exactly — country-mode target shell or prespecified
+target points, full inclination × RAAN seed grid, greedy seed selection — but
+reads all problem inputs from a JSON config file stored in S3 and writes all
+outputs back to S3.  Designed to run inside a Docker container on AWS Batch.
 Submitted via cloud_run.py (single job) or cloud_sweep.py (parameter sweep).
 
 Environment variables (the only three needed):
@@ -20,9 +20,14 @@ Config file schema (JSON) -- required/most-relevant keys shown; see
 _CONFIG_DEFAULTS below for the full set:
     {
         "job_name":                     "china_450km",   // optional; auto-timestamped if omitted
+        "run_name":                     "campaign_7",    // optional; saved into run_config only
+        "is_principal_set":             false,           // optional, default false
+        "target_mode":                  "country",       // "country" or "prespecified", default "country"
         "target_country":               "China",         // required in country mode
-        "target_shell_n_points":        10000,           // optional, default 10000 (country mode)
+        "target_points":                null,            // [[name, lat, lon], ...], required in prespecified mode
+        "target_shell_n_points":        15000,           // optional, default 15000 (country mode)
         "target_altitude_km":           450.0,           // required
+        "altitude_max_repeat_days":     2,               // optional, default 2
         "inclination_sweep_bounds_deg": [20.0, 90.0],   // optional, default [20, 90]
         "v_bo_km_s":                    6.0,             // required
         "salvo_size":                   1,               // required
