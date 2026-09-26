@@ -96,7 +96,7 @@ _CONFIG_DEFAULTS: dict = {
     "n_interceptors_per_sat":       None,    # required
     "mip_gap":                      0.01,
     "time_limit_s":                 None,    # required
-    "altitude_max_repeat_days":     1,
+    "altitude_max_repeat_days":     2,
     # Seed count — set n_seeds_for_milp (flat int) OR seeds_for_milp_by_r_required
     # (dict, keyed on r_required = ceil(salvo_size / n_interceptors_per_sat), not
     # on salvo_size). If both are present, n_seeds_for_milp takes precedence.

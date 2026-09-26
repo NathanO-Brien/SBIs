@@ -82,7 +82,7 @@ INCLINATION_SWEEP_BOUNDS_DEG: dict[str, tuple[float, float]] = {
     "North Korea": (35.0, 90.0),
 }
 INCLINATION_SCREEN_STEP_DEG: float                = 1.0
-ALTITUDE_MAX_REPEAT_DAYS: int                     = 1
+ALTITUDE_MAX_REPEAT_DAYS: int                     = 2
 N_RAAN_OFFSETS: int                               = 10
 SEED_SCREENING_WORKERS: int                       = 8
 # Number of MILP seeds per coverage requirement.
