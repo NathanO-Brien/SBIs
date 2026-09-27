@@ -102,11 +102,17 @@ _CONFIG_DEFAULTS: dict = {
     "mip_gap":                      0.01,
     "time_limit_s":                 None,    # required
     "altitude_max_repeat_days":     2,
-    # Seed count — set n_seeds_for_milp (flat int) OR seeds_for_milp_by_r_required
-    # (dict, keyed on r_required = ceil(salvo_size / n_interceptors_per_sat), not
-    # on salvo_size). If both are present, n_seeds_for_milp takes precedence.
-    "n_seeds_for_milp":             None,    # flat int; if None, falls back to dict below
-    "seeds_for_milp_by_r_required": {1: 25, 5: 25, 20: 50, 50: 100, 100: 150},
+    # Seed selection: rarity-weighted, margin-driven build + trim (mirrors
+    # lee_test2.py) -- replaces the old fixed n_seeds_for_milp / per-
+    # r_required lookup table, which didn't scale with target-set size and
+    # could, via its unconditional "one per every live inclination"
+    # guarantee, blow far past any reasonable margin on wide-inclination
+    # scenarios before the fill phase ever ran.
+    "margin_multiplier":            3.0,
+    "trim_margin_multiplier":       1.25,
+    "max_seeds_safety_cap":         200,
+    "polar_band_deg":               [70.0, 90.0],
+    "polar_band_divisor":           5.0,
     # Simulation parameters
     "dt_s":                         120.0,
     # Old "t_window_s" (time from target launch to intercept, assumed ==
@@ -128,6 +134,11 @@ _CONFIG_DEFAULTS: dict = {
     "mip_focus":                    0,
     "heuristics_frac":              0.05,
     "solver_params":                None,
+    # If set, terminate the solve as soon as a live incumbent's gap drops
+    # below this value, regardless of time_limit_s -- see solve_sclp's
+    # stop_at_gap docstring. None (default): no early stop beyond
+    # mip_gap/time_limit_s.
+    "stop_at_gap":                  None,
 }
 
 _REQUIRED_CONFIG_KEYS = {
@@ -321,10 +332,11 @@ def _load_config(s3_uri: str) -> dict:
         float(x) for x in cfg["inclination_sweep_bounds_deg"]
     ]
     cfg["altitude_max_repeat_days"]     = int(cfg["altitude_max_repeat_days"])
-    cfg["seeds_for_milp_by_r_required"] = {int(k): int(v) for k, v in cfg["seeds_for_milp_by_r_required"].items()}
-    cfg["n_seeds_for_milp"]             = (
-        int(cfg["n_seeds_for_milp"]) if cfg.get("n_seeds_for_milp") is not None else None
-    )
+    cfg["margin_multiplier"]            = float(cfg["margin_multiplier"])
+    cfg["trim_margin_multiplier"]       = float(cfg["trim_margin_multiplier"])
+    cfg["max_seeds_safety_cap"]         = int(cfg["max_seeds_safety_cap"])
+    cfg["polar_band_deg"]               = [float(x) for x in cfg["polar_band_deg"]]
+    cfg["polar_band_divisor"]           = float(cfg["polar_band_divisor"])
     cfg["dt_s"]                         = float(cfg["dt_s"])
     cfg["detection_time_s"]             = float(cfg["detection_time_s"])
     cfg["decision_time_s"]              = float(cfg["decision_time_s"])
@@ -342,54 +354,98 @@ def _load_config(s3_uri: str) -> dict:
     )
     cfg["run_name"]                     = str(cfg["run_name"]) if cfg.get("run_name") is not None else None
     cfg["is_principal_set"]             = bool(cfg.get("is_principal_set", False))
+    cfg["stop_at_gap"]                  = (
+        float(cfg["stop_at_gap"]) if cfg.get("stop_at_gap") is not None else None
+    )
 
     return cfg
 
 
 # ---------------------------------------------------------------------------
-# Greedy seed selection — verbatim from lee_test2.py
+# Seed selection: rarity-weighted, margin-driven build + trim (mirrors
+# lee_test2.py -- see that file for the full design rationale).
 # ---------------------------------------------------------------------------
+
+def _rarity_weights(access: np.ndarray) -> np.ndarray:
+    """Static, pool-level scarcity weight per target, computed once from the
+    full candidate pool before any selection happens.
+
+    Rank-based rather than a raw 1/total_access inverse: a target reachable
+    by only one or two candidates in the whole pool would otherwise get a
+    weight that dwarfs everything else and causes the greedy to fixate on it
+    exclusively. Scarcest target -> 1.0, most common -> a 0.1 floor (kept
+    nonzero so ties among candidates that only help common targets don't
+    degenerate to all-zero scores).
+    """
+    total_access = access.sum(axis=0)
+    n_targets = len(total_access)
+    if n_targets <= 1:
+        return np.ones(n_targets)
+    order = np.argsort(total_access)          # ascending: scarcest target first
+    rank = np.empty(n_targets, dtype=np.float64)
+    rank[order] = np.arange(n_targets, dtype=np.float64)
+    return 0.1 + 0.9 * (1.0 - rank / (n_targets - 1))
+
 
 def _greedy_select_seeds(
     v0_list: list[np.ndarray],
     r_required: int,
-    n_max: int,
+    max_seeds: int,
     *,
+    margin_multiplier: float,
+    polar_band_deg: tuple[float, float],
+    polar_band_divisor: float,
     inc_deg_list: list[float] | None = None,
-) -> list[int]:
-    """Greedy marginal-coverage seed selection (mirrors lee_test2.py exactly).
+) -> tuple[list[int], set[int], np.ndarray, np.ndarray]:
+    """Rarity-weighted, margin-driven greedy seed selection.
 
-    Two-phase selection:
+    Phase 1 -- Polar-band reservation (capped, not unconditional): reserves
+    up to ceil(r_required / polar_band_divisor) seeds, eligible inclinations
+    restricted to polar_band_deg, chosen by the rarity-weighted, margin-capped
+    score. Not "one per every live inclination" -- on a scenario with many
+    live inclinations, guaranteeing all of them can by itself blow past the
+    margin target before Phase 2 ever runs.
 
-    Phase 1 — Inclination guarantee:
-        Every discrete inclination value present in inc_deg_list is
-        guaranteed exactly one representative. Among all RAAN candidates for
-        a given inclination the one with the highest marginal-coverage score
-        is chosen.  Inclinations are processed in greedy order — whichever
-        missing inclination's best candidate contributes the most marginal
-        coverage is selected first.
+    Phase 2 -- Greedy fill: keeps adding seeds (rarity-weighted, margin-capped
+    score, unbounded in inclination) until EITHER the worst-covered target's
+    accumulated access reaches margin_multiplier * r_required, OR max_seeds
+    is hit (a safety ceiling, not a target), OR no live candidates remain.
 
-    Phase 2 — Greedy fill:
-        Remaining n_max slots are filled by standard greedy marginal-coverage,
-        allowing inclinations to repeat at different RAANs.
+    Returns (selected indices in selection order, the set of indices picked
+    during Phase 1 for reporting/tagging purposes only -- NOT protected from
+    trimming, see _trim_seeds -- the final per-target coverage array, and the
+    access matrix).
     """
-    n_seeds   = len(v0_list)
-    access    = np.stack([v0.sum(axis=0) for v0 in v0_list]).astype(np.float64)
-    deficit   = np.full(access.shape[1], float(r_required))
+    n_seeds       = len(v0_list)
+    access        = np.stack([v0.sum(axis=0) for v0 in v0_list]).astype(np.float64)
+    rarity        = _rarity_weights(access)
+    n_targets     = access.shape[1]
+    margin_target = margin_multiplier * r_required
+    coverage      = np.zeros(n_targets, dtype=np.float64)
     selected: list[int] = []
+    polar_reserved: set[int] = set()
     remaining = list(range(n_seeds))
 
+    def _scores(cands_idx: list[int]) -> np.ndarray:
+        deficit = np.maximum(0.0, margin_target - coverage)
+        return (np.minimum(access[cands_idx], deficit) * rarity).sum(axis=1)
+
     # ------------------------------------------------------------------
-    # Phase 1: Inclination guarantee — every unique inclination gets one rep
+    # Phase 1: Polar-band reservation
     # ------------------------------------------------------------------
     if inc_deg_list is not None:
-        covered_incs = {inc_deg_list[i] for i in selected}
-        pending_incs = [
-            inc for inc in sorted(set(inc_deg_list))
-            if inc not in covered_incs
-        ]
+        polar_lo, polar_hi = polar_band_deg
+        polar_budget = int(np.ceil(r_required / polar_band_divisor))
+        pending_incs = sorted(
+            inc for inc in set(inc_deg_list)
+            if polar_lo <= inc <= polar_hi
+        )
 
-        while pending_incs and len(selected) < n_max:
+        while (
+            pending_incs
+            and len(selected) < max_seeds
+            and len(polar_reserved) < polar_budget
+        ):
             best_score   = -np.inf
             best_global  = -1
             best_inc_idx = -1
@@ -398,11 +454,7 @@ def _greedy_select_seeds(
                 cands = [i for i in remaining if abs(inc_deg_list[i] - inc) < 0.1]
                 if not cands:
                     continue
-                cands_access = access[cands]
-                if deficit.max() > 0.0:
-                    scores = np.minimum(cands_access, deficit).sum(axis=1)
-                else:
-                    scores = cands_access.sum(axis=1)
+                scores     = _scores(cands)
                 local_best = int(np.argmax(scores))
                 score      = float(scores[local_best])
                 if score > best_score:
@@ -414,45 +466,60 @@ def _greedy_select_seeds(
                 break
 
             selected.append(best_global)
-            deficit = np.maximum(0.0, deficit - access[best_global])
+            polar_reserved.add(best_global)
+            coverage = coverage + access[best_global]
             remaining.remove(best_global)
             pending_incs.pop(best_inc_idx)
 
     # ------------------------------------------------------------------
-    # Phase 2: Greedy fill — inclinations may repeat at different RAANs
+    # Phase 2: Greedy fill — stop once every target clears the margin target
     # ------------------------------------------------------------------
-    for _ in range(min(n_max - len(selected), len(remaining))):
-        if deficit.max() > 0.0:
-            scores = np.minimum(access[remaining], deficit).sum(axis=1)
-        else:
-            scores = access[remaining].sum(axis=1)
+    while remaining and len(selected) < max_seeds:
+        if float(coverage.min()) >= margin_target:
+            break
+        scores      = _scores(remaining)
         best_local  = int(np.argmax(scores))
         best_global = remaining[best_local]
         selected.append(best_global)
-        deficit = np.maximum(0.0, deficit - access[best_global])
+        coverage = coverage + access[best_global]
         remaining.pop(best_local)
 
-    return selected
+    return selected, polar_reserved, coverage, access
 
 
-def _seeds_for_r_required(r_required: int, lookup: dict[int, int]) -> int:
-    """Return MILP seed count for r_required from the provided lookup dict.
+def _trim_seeds(
+    selected: list[int],
+    access: np.ndarray,
+    coverage: np.ndarray,
+    r_required: int,
+    trim_margin_multiplier: float,
+) -> list[int]:
+    """Reverse marginal-contribution trim -- single pass, no seed is exempt.
 
-    r_required = ceil(salvo_size / n_interceptors_per_sat) is the number of
-    satellites that must be simultaneously in view of a target — the
-    quantity that actually governs how large the greedy-selected seed pool
-    needs to be, not salvo_size on its own. Finds the largest key ≤
-    r_required; falls back to the smallest key if r_required is below all
-    defined keys.
+    Repeatedly removes whichever currently-selected seed does the LEAST
+    damage to the worst-covered target, stopping once no further removal
+    would leave every target at or above trim_margin_multiplier * r_required.
+    No seed is exempt regardless of which phase selected it -- Phase 1
+    reserves only a small, requirement-scaled number of seeds, so the risk of
+    trim removing a large structural investment is bounded and acceptable.
     """
-    keys   = sorted(lookup)
-    result = lookup[keys[0]]
-    for k in keys:
-        if k <= r_required:
-            result = lookup[k]
-        else:
+    floor    = trim_margin_multiplier * r_required
+    current  = list(selected)
+    coverage = coverage.copy()
+
+    while True:
+        remaining_margins = {
+            i: float((coverage - access[i]).min()) for i in current
+        }
+        if not remaining_margins:
             break
-    return result
+        best_i = max(remaining_margins, key=remaining_margins.get)
+        if remaining_margins[best_i] < floor:
+            break
+        current.remove(best_i)
+        coverage = coverage - access[best_i]
+
+    return current
 
 
 # ---------------------------------------------------------------------------
@@ -712,42 +779,66 @@ def main() -> None:
         n_seeds    = len(v0_list)
     n_seeds_live = n_seeds
 
-    if cfg.get("n_seeds_for_milp") is not None:
-        n_seeds_for_milp = int(cfg["n_seeds_for_milp"])
-    else:
-        n_seeds_for_milp = _seeds_for_r_required(r_required, cfg["seeds_for_milp_by_r_required"])
-    inc_deg_list = [float(p[0]) for p in seed_pairs]
-    greedy_idx   = _greedy_select_seeds(
-        v0_list, r_required, n_seeds_for_milp,
+    inc_deg_list  = [float(p[0]) for p in seed_pairs]
+    margin_target = cfg["margin_multiplier"] * r_required
+    build_idx, polar_reserved_set, build_coverage, access_full = _greedy_select_seeds(
+        v0_list, r_required, cfg["max_seeds_safety_cap"],
+        margin_multiplier=cfg["margin_multiplier"],
+        polar_band_deg=tuple(cfg["polar_band_deg"]),
+        polar_band_divisor=cfg["polar_band_divisor"],
         inc_deg_list=inc_deg_list,
     )
-    n_selected = len(greedy_idx)
-    print(f"\nGreedy seed selection: {n_selected} of {n_seeds} live seeds → MILP", flush=True)
-
-    access_sum     = sum(v0_list[i].sum(axis=0) for i in greedy_idx)
-    proxy_min      = float(access_sum.min())
-    proxy_mean     = float(access_sum.mean())
-    feasible_proxy = proxy_min >= r_required
+    build_worst_margin = float(build_coverage.min())
+    n_built = len(build_idx)
     print(
-        f"  Coverage proxy (all slots of selected seeds): "
-        f"min={proxy_min:.1f}  mean={proxy_mean:.1f}  "
-        f"requirement={r_required}  "
-        + ("✓ feasible" if feasible_proxy else "⚠ may be infeasible — consider raising N_SEEDS_FOR_MILP"),
+        f"\nBuild phase: {n_built} of {n_seeds} live seeds selected  "
+        f"(target: worst-slot margin >= {cfg['margin_multiplier']:.2f}x requirement = {margin_target:.1f})",
+        flush=True,
+    )
+    print(
+        f"  Worst-slot margin achieved: {build_worst_margin:.1f}  "
+        f"({build_worst_margin / r_required:.2f}x requirement)"
+        + ("  [safety cap max_seeds_safety_cap reached before target margin]"
+           if n_built >= cfg["max_seeds_safety_cap"] and build_worst_margin < margin_target - 1e-9
+           else ""),
         flush=True,
     )
 
-    # Tag seeds by selection phase: inc-guaranteed, or greedy fill.
-    inc_guaranteed_set: set[int] = set()
-    if inc_deg_list:
-        _seen_incs: set[float] = set()
-        for idx in greedy_idx:
-            _inc_val = inc_deg_list[idx]
-            if _inc_val not in _seen_incs:
-                inc_guaranteed_set.add(idx)
-                _seen_incs.add(_inc_val)
+    trim_floor = cfg["trim_margin_multiplier"] * r_required
+    greedy_idx = _trim_seeds(
+        build_idx, access_full, build_coverage, r_required,
+        cfg["trim_margin_multiplier"],
+    )
+    n_selected    = len(greedy_idx)
+    trim_coverage = access_full[greedy_idx].sum(axis=0)
+    trim_worst_margin = float(trim_coverage.min())
+    n_trimmed = n_built - n_selected
+    print(
+        f"Trim phase : removed {n_trimmed} seed(s), {n_built} → {n_selected}  "
+        f"(floor: worst-slot margin >= {cfg['trim_margin_multiplier']:.2f}x requirement = {trim_floor:.1f})",
+        flush=True,
+    )
+    print(
+        f"  Worst-slot margin after trim: {trim_worst_margin:.1f}  "
+        f"({trim_worst_margin / r_required:.2f}x requirement)",
+        flush=True,
+    )
+
+    feasible_proxy = trim_worst_margin >= r_required
+    print(
+        f"  Coverage proxy (all slots of selected seeds): "
+        f"min={trim_worst_margin:.1f}  mean={float(trim_coverage.mean()):.1f}  "
+        f"requirement={r_required}  "
+        + ("✓ feasible" if feasible_proxy
+           else "⚠ infeasible even after build+trim — try raising margin_multiplier or max_seeds_safety_cap"),
+        flush=True,
+    )
+
+    # Tag seeds by selection phase: polar-band reservation (Phase 1) vs.
+    # quantity-driven greedy fill (Phase 2). Not a protection from trimming.
     for rank, idx in enumerate(greedy_idx):
         inc, raan = seed_pairs[idx]
-        tag = "  [inc. guaranteed]" if idx in inc_guaranteed_set else ""
+        tag = "  [phase 1: polar-band reservation]" if idx in polar_reserved_set else ""
         print(
             f"  {rank + 1:2d}: i={inc:5.1f}°  RAAN={raan:6.1f}°  "
             f"access/target={v0_list[idx].sum(axis=0).mean():.1f}{tag}",
@@ -793,6 +884,7 @@ def main() -> None:
         mip_focus=cfg["mip_focus"],
         heuristics_frac=cfg["heuristics_frac"],
         solver_params=cfg["solver_params"],
+        stop_at_gap=cfg["stop_at_gap"],
     )
 
     # ------------------------------------------------------------------
@@ -857,7 +949,17 @@ def main() -> None:
         "raan_step_deg":                  float(raan_interval / cfg["n_raan_offsets"]),
         "n_seeds_simulated":              int(n_seeds_total),
         "n_seeds_live":                   int(n_seeds_live),
-        "n_seeds_for_milp":               n_seeds_for_milp,
+        "margin_multiplier":              cfg["margin_multiplier"],
+        "trim_margin_multiplier":         cfg["trim_margin_multiplier"],
+        "max_seeds_safety_cap":           cfg["max_seeds_safety_cap"],
+        "polar_band_deg":                 list(cfg["polar_band_deg"]),
+        "polar_band_divisor":             cfg["polar_band_divisor"],
+        "n_seeds_built":                  int(n_built),
+        "n_seeds_trimmed":                int(n_trimmed),
+        "n_seeds_after_trim":             int(n_selected),
+        "build_worst_margin":             build_worst_margin,
+        "trim_worst_margin":              trim_worst_margin,
+        "bilp_n_vars":                    int(n_selected * L),
         "seeds_selected": [
             {
                 "rank":     rank + 1,
@@ -876,6 +978,7 @@ def main() -> None:
         "mip_focus":                      cfg["mip_focus"],
         "heuristics_frac":                cfg["heuristics_frac"],
         "solver_params":                  cfg["solver_params"],
+        "stop_at_gap":                    cfg["stop_at_gap"],
         # --- Result summary ---
         "timestamp_utc":                  datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "result_status":                  result.status_str,
