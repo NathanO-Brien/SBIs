@@ -92,9 +92,39 @@ TARGET_ALTITUDE_KM: float = 400.0
 # Recommended: 3–5 for country targets; 1 is sufficient for point targets.
 N_RAAN_OFFSETS: int = 5
 SEED_SCREENING_WORKERS: int = 8
-# Number of seed orbits passed to the MILP after greedy marginal-coverage
-# ranking.  All seeds are simulated; only the best N are given to Gurobi.
-N_SEEDS_FOR_MILP: int = 10
+
+# ---------------------------------------------------------------------------
+# Seed selection strategy: rarity-weighted, margin-driven build + trim.
+#
+# Rather than handing the MILP a fixed seed count (the old N_SEEDS_FOR_MILP
+# knob), seeds are added greedily -- each pick weighted by how globally
+# scarce its access is across the whole candidate pool, not just current
+# deficit -- until every target's accumulated access reaches
+# MARGIN_MULTIPLIER x r_required at the worst-covered target. That number
+# doesn't need to be hand-tuned per r_required/n_targets combination the way
+# a fixed count did. A reverse-greedy trim pass then removes whichever
+# seeds are least damaging to keep, down to a leaner TRIM_MARGIN_MULTIPLIER x
+# r_required floor, to recover most of the extra seed count spent building a
+# safety margin during construction. See _greedy_select_seeds/_trim_seeds.
+# ---------------------------------------------------------------------------
+MARGIN_MULTIPLIER: float = 3.0
+TRIM_MARGIN_MULTIPLIER: float = 1.25
+# Hard ceiling on total seeds passed to the MILP, regardless of margin
+# reached -- a safety valve only (e.g. a target that's geometrically
+# unreachable at the target margin within the candidate grid), not itself a
+# target to hit. The build stops on margin, not on this count, unless this
+# cap binds first.
+MAX_SEEDS_FOR_MILP: int = 200
+# Phase 1 does not guarantee a representative for EVERY live inclination --
+# on a wide live-inclination-range scenario that can, by itself, blow far
+# past MARGIN_MULTIPLIER before Phase 2 (the actual margin-driven logic) ever
+# runs. Instead, Phase 1 reserves a SMALL, requirement-scaled number of seeds
+# restricted to a narrow near-polar inclination band -- generalizing the
+# older, fixed 3-seed polar-reservation feature (removed) into something
+# requirement-scaled and rarity-weighted, rather than everything else being
+# left entirely to Phase 2's unconstrained greedy fill.
+POLAR_BAND_DEG: tuple[float, float] = (70.0, 90.0)
+POLAR_BAND_DIVISOR: float = 5.0
 
 # ---------------------------------------------------------------------------
 # Intercept salvo parameters
@@ -114,6 +144,13 @@ IS_PRINCIPAL_SET: bool = False
 # ---------------------------------------------------------------------------
 MIP_GAP: float = 0.001
 TIME_LIMIT_S: float = 45
+# If set, stop as soon as a live incumbent's gap drops below this value,
+# regardless of TIME_LIMIT_S -- e.g. 0.999999 stops as soon as any
+# non-trivial lower bound is established (gap under 100%). None: no early
+# stop beyond MIP_GAP/TIME_LIMIT_S. Intended for quickly comparing seed
+# pools/problem sizes across test runs without waiting out a full time
+# budget on each one.
+STOP_AT_GAP: float | None = None
 # mip_focus/heuristics_frac/solver_params are intentionally not overridden
 # here -- solve_sclp() now defaults to vanilla Gurobi tuning (MIPFocus=0,
 # Heuristics=0.05, no solver_params overrides). The architecture to
@@ -239,51 +276,116 @@ def _result_subdir(actual_alt_km: float) -> Path:
     return path
 
 
+def _rarity_weights(access: np.ndarray) -> np.ndarray:
+    """Static, pool-level scarcity weight per target, computed once from the
+    full candidate pool before any selection happens.
+
+    Rank-based rather than a raw 1/total_access inverse: a target reachable
+    by only one or two candidates in the whole pool would otherwise get a
+    weight that dwarfs everything else and causes the greedy to fixate on it
+    exclusively. Scarcest target -> 1.0, most common -> a 0.1 floor (kept
+    nonzero so ties among candidates that only help common targets don't
+    degenerate to all-zero scores).
+    """
+    total_access = access.sum(axis=0)
+    n_targets = len(total_access)
+    if n_targets <= 1:
+        return np.ones(n_targets)
+    order = np.argsort(total_access)          # ascending: scarcest target first
+    rank = np.empty(n_targets, dtype=np.float64)
+    rank[order] = np.arange(n_targets, dtype=np.float64)
+    return 0.1 + 0.9 * (1.0 - rank / (n_targets - 1))
+
+
 def _greedy_select_seeds(
     v0_list: list[np.ndarray],
     r_required: int,
-    n_max: int,
+    max_seeds: int,
     *,
+    margin_multiplier: float,
     inc_deg_list: list[float] | None = None,
-) -> list[int]:
-    """Greedy marginal-coverage seed selection.
+) -> tuple[list[int], set[int], np.ndarray, np.ndarray]:
+    """Rarity-weighted, margin-driven greedy seed selection.
 
-    Two-phase selection:
+    Two changes relative to a plain deficit-capped greedy:
 
-    Phase 1 — Inclination guarantee:
-        Every discrete inclination value present in inc_deg_list is
-        guaranteed exactly one representative. Among all RAAN candidates for
-        a given inclination the one with the highest marginal-coverage score
-        is chosen (unique access against the current deficit; total access
-        once deficit is met).  Inclinations are processed in greedy order —
-        whichever missing inclination's best candidate contributes the most
-        is selected first.
+    1. Every score is weighted by a static, pool-level rarity weight per
+       target (see _rarity_weights). A candidate's score would otherwise
+       only reflect how much CURRENT deficit it satisfied, with no notion of
+       how globally scarce a target's access is across the whole candidate
+       pool -- two targets at equal current deficit would score identically
+       even if one was reachable by 90% of the pool and the other by 2%.
+    2. The per-target "deficit" driving both the capped score and the
+       stopping rule is measured against margin_multiplier * r_required, not
+       bare r_required. This replaces a fixed seed count with a measured
+       stopping criterion -- keep adding seeds until the WORST-covered
+       target's accumulated access reaches margin_multiplier x the
+       requirement, not until an arbitrary count is hit. Capping the deficit
+       against the actual build target (rather than capping at 1x and
+       falling back to an unweighted raw-access tiebreaker once 1x is
+       reached) means every pick, all the way from zero coverage up through
+       the margin target, stays directed at whichever target most needs it.
 
-    Phase 2 — Greedy fill:
-        Remaining n_max slots are filled by the standard greedy marginal-
-        coverage criterion, allowing inclinations to repeat at different RAANs.
+    Phase 1 -- Polar-band reservation (capped, not unconditional):
+        Reserves up to ceil(r_required / POLAR_BAND_DIVISOR) seeds, eligible
+        inclinations restricted to POLAR_BAND_DEG, chosen by the same
+        rarity-weighted, margin-capped score used everywhere else. This is
+        NOT "one per every live inclination" -- on a scenario with many live
+        inclinations, guaranteeing all of them can by itself blow past the
+        margin target before Phase 2 ever runs. Restricting to a small,
+        bounded, near-polar band instead targets the band Phase 2's pure
+        marginal-value scoring is least likely to visit on its own (near-
+        polar orbits typically have low instantaneous access to a specific
+        mid-latitude target set, so an unconstrained greedy tends to
+        under-sample them even though they may offer valuable, hard-to-
+        replace coverage geometry).
 
-    Returns a list of indices (into v0_list) in selection order.
+    Phase 2 -- Greedy fill:
+        Keeps adding seeds (rarity-weighted, margin-capped score, unbounded
+        in inclination) until EITHER the worst-covered target's accumulated
+        access reaches margin_multiplier * r_required, OR max_seeds is hit
+        (a safety ceiling, not a target), OR no live candidates remain.
+
+    Returns (selected indices in selection order, the set of indices picked
+    during Phase 1 for reporting/tagging purposes only -- NOT protected from
+    trimming, see _trim_seeds -- the final per-target coverage array, and the
+    access matrix).
     """
-    n_seeds   = len(v0_list)
-    access    = np.stack([v0.sum(axis=0) for v0 in v0_list]).astype(np.float64)
-    deficit   = np.full(access.shape[1], float(r_required))
+    n_seeds       = len(v0_list)
+    access        = np.stack([v0.sum(axis=0) for v0 in v0_list]).astype(np.float64)
+    rarity        = _rarity_weights(access)
+    n_targets     = access.shape[1]
+    margin_target = margin_multiplier * r_required
+    coverage      = np.zeros(n_targets, dtype=np.float64)
     selected: list[int] = []
+    polar_reserved: set[int] = set()
     remaining = list(range(n_seeds))
 
+    def _scores(cands_idx: list[int]) -> np.ndarray:
+        deficit = np.maximum(0.0, margin_target - coverage)
+        return (np.minimum(access[cands_idx], deficit) * rarity).sum(axis=1)
+
     # ------------------------------------------------------------------
-    # Phase 1: Inclination guarantee — every unique inclination gets one rep
+    # Phase 1: Polar-band reservation -- capped at ceil(r_required /
+    # POLAR_BAND_DIVISOR) seeds, eligible inclinations restricted to
+    # POLAR_BAND_DEG. Not "one per every live inclination" -- see docstring.
     # ------------------------------------------------------------------
     if inc_deg_list is not None:
-        covered_incs = {inc_deg_list[i] for i in selected}
-        pending_incs = [
-            inc for inc in sorted(set(inc_deg_list))
-            if inc not in covered_incs
-        ]
+        polar_lo, polar_hi = POLAR_BAND_DEG
+        polar_budget = int(np.ceil(r_required / POLAR_BAND_DIVISOR))
+        pending_incs = sorted(
+            inc for inc in set(inc_deg_list)
+            if polar_lo <= inc <= polar_hi
+        )
 
-        while pending_incs and len(selected) < n_max:
-            # Among all pending inclinations, find the (inc, candidate) pair
-            # that contributes the most marginal coverage right now.
+        while (
+            pending_incs
+            and len(selected) < max_seeds
+            and len(polar_reserved) < polar_budget
+        ):
+            # Among all pending near-polar inclinations, find the (inc,
+            # candidate) pair that contributes the most rarity-weighted
+            # marginal coverage.
             best_score   = -np.inf
             best_global  = -1
             best_inc_idx = -1
@@ -292,11 +394,7 @@ def _greedy_select_seeds(
                 cands = [i for i in remaining if abs(inc_deg_list[i] - inc) < 0.1]
                 if not cands:
                     continue
-                cands_access = access[cands]
-                if deficit.max() > 0.0:
-                    scores = np.minimum(cands_access, deficit).sum(axis=1)
-                else:
-                    scores = cands_access.sum(axis=1)
+                scores     = _scores(cands)
                 local_best = int(np.argmax(scores))
                 score      = float(scores[local_best])
                 if score > best_score:
@@ -308,25 +406,67 @@ def _greedy_select_seeds(
                 break  # no live candidates remain for any pending inclination
 
             selected.append(best_global)
-            deficit = np.maximum(0.0, deficit - access[best_global])
+            polar_reserved.add(best_global)
+            coverage = coverage + access[best_global]
             remaining.remove(best_global)
             pending_incs.pop(best_inc_idx)
 
     # ------------------------------------------------------------------
-    # Phase 2: Greedy fill — inclinations may repeat at different RAANs
+    # Phase 2: Greedy fill — stop once every target clears the margin target
     # ------------------------------------------------------------------
-    for _ in range(min(n_max - len(selected), len(remaining))):
-        if deficit.max() > 0.0:
-            scores = np.minimum(access[remaining], deficit).sum(axis=1)
-        else:
-            scores = access[remaining].sum(axis=1)
+    while remaining and len(selected) < max_seeds:
+        if float(coverage.min()) >= margin_target:
+            break
+        scores      = _scores(remaining)
         best_local  = int(np.argmax(scores))
         best_global = remaining[best_local]
         selected.append(best_global)
-        deficit = np.maximum(0.0, deficit - access[best_global])
+        coverage = coverage + access[best_global]
         remaining.pop(best_local)
 
-    return selected
+    return selected, polar_reserved, coverage, access
+
+
+def _trim_seeds(
+    selected: list[int],
+    access: np.ndarray,
+    coverage: np.ndarray,
+    r_required: int,
+    trim_margin_multiplier: float,
+) -> list[int]:
+    """Reverse marginal-contribution trim -- single pass, no seed is exempt.
+
+    Repeatedly removes whichever currently-selected seed does the LEAST
+    damage to the worst-covered target, stopping once no further removal
+    would leave every target at or above trim_margin_multiplier * r_required.
+    This is the reverse of the construction greedy -- the same vectorized
+    "score everyone, take the extremal one, update state" pattern, run
+    backward with a floor instead of a target.
+
+    No seed is exempt from removal regardless of which phase selected it --
+    Phase 1 reserves only a small, requirement-scaled number of seeds (see
+    POLAR_BAND_DEG / POLAR_BAND_DIVISOR), so the risk of trim removing a
+    large structural investment is bounded and acceptable; if the polar-band
+    reservation genuinely isn't earning its keep for a given scenario,
+    letting trim remove it is correct behavior, not a bug.
+    """
+    floor    = trim_margin_multiplier * r_required
+    current  = list(selected)
+    coverage = coverage.copy()
+
+    while True:
+        remaining_margins = {
+            i: float((coverage - access[i]).min()) for i in current
+        }
+        if not remaining_margins:
+            break
+        best_i = max(remaining_margins, key=remaining_margins.get)
+        if remaining_margins[best_i] < floor:
+            break
+        current.remove(best_i)
+        coverage = coverage - access[best_i]
+
+    return current
 
 
 def main() -> None:
@@ -520,39 +660,64 @@ def main() -> None:
         n_seeds    = len(v0_list)
     n_seeds_live = n_seeds
 
-    # Step 2 — greedy marginal-coverage ranking
-    inc_deg_list = [float(p[0]) for p in seed_pairs]
-    greedy_idx   = _greedy_select_seeds(
-        v0_list, r_required, N_SEEDS_FOR_MILP,
+    # Step 2 — rarity-weighted, margin-driven build (replaces the old fixed
+    # N_SEEDS_FOR_MILP seed count -- see _greedy_select_seeds' docstring)
+    inc_deg_list  = [float(p[0]) for p in seed_pairs]
+    margin_target = MARGIN_MULTIPLIER * r_required
+    build_idx, polar_reserved_set, build_coverage, access_full = _greedy_select_seeds(
+        v0_list, r_required, MAX_SEEDS_FOR_MILP,
+        margin_multiplier=MARGIN_MULTIPLIER,
         inc_deg_list=inc_deg_list,
     )
-    n_selected = len(greedy_idx)
-    print(f"\nGreedy seed selection: {n_selected} of {n_seeds} live seeds → MILP")
+    build_worst_margin = float(build_coverage.min())
+    n_built = len(build_idx)
+    print(
+        f"\nBuild phase: {n_built} of {n_seeds} live seeds selected  "
+        f"(target: worst-slot margin >= {MARGIN_MULTIPLIER:.2f}x requirement = {margin_target:.1f})"
+    )
+    print(
+        f"  Worst-slot margin achieved: {build_worst_margin:.1f}  "
+        f"({build_worst_margin / r_required:.2f}x requirement)"
+        + ("  [safety cap MAX_SEEDS_FOR_MILP reached before target margin]"
+           if n_built >= MAX_SEEDS_FOR_MILP and build_worst_margin < margin_target - 1e-9
+           else "")
+    )
+
+    # Step 3 — reverse marginal-contribution trim back down to a leaner floor
+    trim_floor = TRIM_MARGIN_MULTIPLIER * r_required
+    greedy_idx = _trim_seeds(
+        build_idx, access_full, build_coverage, r_required,
+        TRIM_MARGIN_MULTIPLIER,
+    )
+    n_selected    = len(greedy_idx)
+    trim_coverage = access_full[greedy_idx].sum(axis=0)
+    trim_worst_margin = float(trim_coverage.min())
+    n_trimmed = n_built - n_selected
+    print(
+        f"Trim phase : removed {n_trimmed} seed(s), {n_built} → {n_selected}  "
+        f"(floor: worst-slot margin >= {TRIM_MARGIN_MULTIPLIER:.2f}x requirement = {trim_floor:.1f})"
+    )
+    print(
+        f"  Worst-slot margin after trim: {trim_worst_margin:.1f}  "
+        f"({trim_worst_margin / r_required:.2f}x requirement)"
+    )
 
     # Coverage proxy: sum of per-target access over selected seeds.
     # Due to the circulant property this equals simultaneous views at any t.
-    access_sum = sum(v0_list[i].sum(axis=0) for i in greedy_idx)
-    proxy_min  = float(access_sum.min())
-    proxy_mean = float(access_sum.mean())
-    feasible_proxy = proxy_min >= r_required
+    feasible_proxy = trim_worst_margin >= r_required
     print(
         f"  Coverage proxy (all slots of selected seeds): "
-        f"min={proxy_min:.1f}  mean={proxy_mean:.1f}  "
+        f"min={trim_worst_margin:.1f}  mean={float(trim_coverage.mean()):.1f}  "
         f"requirement={r_required}  "
-        + ("✓ feasible" if feasible_proxy else "⚠ may be infeasible — consider raising N_SEEDS_FOR_MILP")
+        + ("✓ feasible" if feasible_proxy
+           else "⚠ infeasible even after build+trim — try raising MARGIN_MULTIPLIER or MAX_SEEDS_FOR_MILP")
     )
-    # Tag seeds by selection phase: inc-guaranteed, or greedy fill.
-    inc_guaranteed_set: set[int] = set()
-    if inc_deg_list:
-        _seen_incs: set[float] = set()
-        for idx in greedy_idx:
-            _inc_val = inc_deg_list[idx]
-            if _inc_val not in _seen_incs:
-                inc_guaranteed_set.add(idx)
-                _seen_incs.add(_inc_val)
+    # Tag seeds by selection phase: polar-band reservation (Phase 1) vs.
+    # quantity-driven greedy fill (Phase 2). Not a protection from trimming
+    # -- purely informational (see _trim_seeds).
     for rank, idx in enumerate(greedy_idx):
         inc, raan = seed_pairs[idx]
-        tag = "  [inc. guaranteed]" if idx in inc_guaranteed_set else ""
+        tag = "  [phase 1: polar-band reservation]" if idx in polar_reserved_set else ""
         print(f"  {rank + 1:2d}: i={inc:5.1f}°  RAAN={raan:6.1f}°  "
               f"access/target={v0_list[idx].sum(axis=0).mean():.1f}{tag}")
 
@@ -593,6 +758,7 @@ def main() -> None:
         time_limit_s=TIME_LIMIT_S,
         log_file=log_file,
         verbose=True,
+        stop_at_gap=STOP_AT_GAP,
     )
 
     print("\n" + "=" * 60)
@@ -649,7 +815,17 @@ def main() -> None:
         "raan_step_deg":                  float(raan_interval / N_RAAN_OFFSETS),
         "n_seeds_simulated":              int(n_seeds_total),
         "n_seeds_live":                   int(n_seeds_live),
-        "n_seeds_for_milp":               N_SEEDS_FOR_MILP,
+        "margin_multiplier":              MARGIN_MULTIPLIER,
+        "trim_margin_multiplier":         TRIM_MARGIN_MULTIPLIER,
+        "max_seeds_safety_cap":           MAX_SEEDS_FOR_MILP,
+        "polar_band_deg":                 list(POLAR_BAND_DEG),
+        "polar_band_divisor":             POLAR_BAND_DIVISOR,
+        "n_seeds_built":                  int(n_built),
+        "n_seeds_trimmed":                int(n_trimmed),
+        "n_seeds_after_trim":             int(n_selected),
+        "build_worst_margin":             build_worst_margin,
+        "trim_worst_margin":              trim_worst_margin,
+        "bilp_n_vars":                    int(n_selected * L),
         "seeds_selected": [
             {
                 "rank":     rank + 1,
@@ -665,6 +841,7 @@ def main() -> None:
         # --- Solver ---
         "mip_gap_target":                 MIP_GAP,
         "time_limit_s":                   None if TIME_LIMIT_S == float("inf") else TIME_LIMIT_S,
+        "stop_at_gap":                    STOP_AT_GAP,
         # --- Result summary ---
         "timestamp_utc":                  datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "result_status":                  result.status_str,
