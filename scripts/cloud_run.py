@@ -841,7 +841,13 @@ DT_S:               float = 120.0
 INC_SCREEN_STEP_DEG: float = 1.0
 N_RAAN_OFFSETS:     int   = 10
 SEED_WORKERS:       int   = 8
-N_SEEDS_FOR_MILP:   int   = 25
+# n_seeds_for_milp is intentionally not exposed here -- batch_worker.py's
+# config schema now defaults to the rarity-weighted, margin-driven build +
+# trim seed selection (margin_multiplier=3.0, trim_margin_multiplier=1.25,
+# etc.) when these keys are absent from the uploaded config, which is what
+# omitting the old fixed seed count here achieves. The schema still accepts
+# overrides for these; re-add CLI flags below if per-run tuning is worth
+# reintroducing.
 
 # Solver
 MIP_GAP:        float = 0.01
@@ -912,7 +918,6 @@ def main() -> None:
     parser.add_argument("--inc-step",     default=INC_SCREEN_STEP_DEG, type=float, help=f"Inclination step in deg (default: {INC_SCREEN_STEP_DEG})")
     parser.add_argument("--n-raan",       default=N_RAAN_OFFSETS,      type=int,   help=f"RAAN offsets per inclination (default: {N_RAAN_OFFSETS})")
     parser.add_argument("--seed-workers", default=SEED_WORKERS,        type=int,   help=f"Parallel seed workers (default: {SEED_WORKERS})")
-    parser.add_argument("--n-seeds",      default=N_SEEDS_FOR_MILP,    type=int,   help=f"Seeds passed to MILP (default: {N_SEEDS_FOR_MILP})")
     parser.add_argument("--n-points",     default=TARGET_SHELL_N_POINTS, type=int, help=f"Target shell points (country mode, default: {TARGET_SHELL_N_POINTS})")
 
     # Solver
@@ -1010,7 +1015,6 @@ def main() -> None:
         "inc_screen_step_deg":          args.inc_step,
         "n_raan_offsets":               args.n_raan,
         "seed_workers":                 args.seed_workers,
-        "n_seeds_for_milp":             args.n_seeds,
         # Solver
         "mip_gap":                      args.mip_gap,
         "time_limit_s":                 args.time_limit,
