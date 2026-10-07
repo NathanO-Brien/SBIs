@@ -323,7 +323,9 @@ def _load_config(s3_uri: str) -> dict:
     cfg["salvo_size"]                   = int(cfg["salvo_size"])
     cfg["n_interceptors_per_sat"]       = int(cfg["n_interceptors_per_sat"])
     cfg["v_bo_km_s"]                    = float(cfg["v_bo_km_s"])
-    cfg["target_shell_n_points"]        = int(cfg["target_shell_n_points"])
+    cfg["target_shell_n_points"]        = (
+        int(cfg["target_shell_n_points"]) if cfg.get("target_shell_n_points") is not None else None
+    )
     cfg["target_country"]               = (
         str(cfg["target_country"]).strip() if cfg.get("target_country") is not None else None
     )

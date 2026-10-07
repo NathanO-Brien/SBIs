@@ -25,6 +25,7 @@ import argparse
 import datetime
 import itertools
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -45,7 +46,7 @@ AWS_REGION:         str = "us-east-1"
 # Fixed parameters — must match sweep_optimize.py / batch_worker.py exactly.
 # ---------------------------------------------------------------------------
 TARGET_SHELL_N_POINTS:      int   = 15000
-MIP_GAP:                    float = 0.001
+MIP_GAP:                    float = 0
 TIME_LIMIT_S:               float = 14400.0
 ALTITUDE_MAX_REPEAT_DAYS:   int   = 2
 DT_S:                       float = 120.0
@@ -66,13 +67,13 @@ SEED_WORKERS:               int   = 8
 # (one fixed target-point set, shared by every combo in the sweep; not itself
 # a swept dimension).
 # ---------------------------------------------------------------------------
-TARGET_MODE: str = "country"
+TARGET_MODE: str = "prespecified"
 TARGET_POINTS: list[list] = [
-    ["NK: Yongbyon (nuclear)", 39.79, 125.66],
+    ["Name", 39.79, 125.66],
 ]
 # If set (and TARGET_MODE == "prespecified"), overrides TARGET_POINTS above by
 # loading a CSV -- see sbi_coverage.core.target_points.load_target_points_csv.
-TARGET_POINTS_CSV: str | Path | None = None
+TARGET_POINTS_CSV: str | Path | None = r"C:\Users\natha\OneDrive\Documents\GT 2026 Fall Semester\Research\Principle Sets\CN\Prespecified_100_ICBMS_CN_High_Priority.csv"
 
 # Per-country inclination sweep bounds — lower bound ≈ minimum latitude of
 # interest for each country, matching sweep_optimize.py. Prespecified mode
@@ -90,38 +91,32 @@ DEFAULT_INCLINATION_BOUNDS: tuple[float, float] = (0, 90.0)
 # job/config naming, which is unaffected by these). Each combo's saved
 # run_name gets "_<n>" appended, n being its 1-based position in the grid.
 # ---------------------------------------------------------------------------
-RUN_NAME: str | None = None
-IS_PRINCIPAL_SET: bool = False
+RUN_NAME: str | None = "Prespecified_100_ICBMS_CN_High_Priority_PRINCIPAL"
+IS_PRINCIPAL_SET: bool = True
 
 # ---------------------------------------------------------------------------
 # Sweep grid — mirrors sweep_optimize.py defaults.
 # Change these lists to define the combinations you want to run.
 # ---------------------------------------------------------------------------
-SWEEP_COUNTRIES:                list[str]   = ["Iran"]
+SWEEP_COUNTRIES:                list[str]   = []
 SWEEP_ALTITUDES_KM:             list[float] = [400.0]
-SWEEP_SALVO_SIZES:              list[int]   = [1, 10, 20, 35, 50, 75, 100]
-SWEEP_INTERCEPTORS_PER_SAT:     list[int]   = [1, 2, 4, 6]
-SWEEP_BURNOUT_VELOCITIES_KM_S:  list[float] = [4.0, 5.0, 6.0, 10.0]
+SWEEP_SALVO_SIZES:              list[int]   = [100]
+SWEEP_INTERCEPTORS_PER_SAT:     list[int]   = [1, 2, 3, 4, 5, 6]
+SWEEP_BURNOUT_VELOCITIES_KM_S:  list[float] = [4.0, 6.0]
 # New sweepable dimensions -- default to a single element (the timing/accel
 # value CoverageConfig would otherwise default to) so an unmodified sweep's
 # grid size is unaffected.
-SWEEP_DETECTION_TIMES_S:        list[float] = [0.0]
+SWEEP_DETECTION_TIMES_S:        list[float] = [0.0, 15.0, 30.0, 45.0]
 SWEEP_DECISION_TIMES_S:         list[float] = [0.0]
 SWEEP_BURNOUT_TIMES_S:          list[float] = [170.0]
 SWEEP_A_G_LIST:                 list[float] = [10.0]
-# Keyed on r_required = ceil(salvo_size / n_interceptors_per_sat), not on
-# salvo_size directly — the greedy pool must be large enough for the solver
-# to find r_required satellites simultaneously in view of every target, and
-# that's the quantity that actually drives feasibility/difficulty. Two jobs
-# with the same salvo_size but different n_interceptors_per_sat can need very
-# different pool sizes; keying on salvo_size alone ignored that.
-SEEDS_FOR_MILP_BY_R_REQUIRED:   dict  = {1: 10,
-                                        5: 15,
-                                        20: 20,
-                                        35: 25,
-                                        50: 35,
-                                        75: 45,
-                                        100: 50}
+# margin_multiplier/trim_margin_multiplier/max_seeds_safety_cap/polar_band_deg/
+# polar_band_divisor (the rarity-weighted, margin-driven build+trim seed
+# selection -- see sweep_optimize.py/lee_test2.py) are intentionally not
+# exposed here -- batch_worker.py's config schema already defaults to the
+# same values (3.0/1.25/200/[70,90]/5.0) when these keys are absent from the
+# uploaded config, which is what omitting them here achieves. The schema
+# still accepts them if per-sweep overrides are worth reintroducing.
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -167,7 +162,6 @@ def _config_for(
         "mip_gap":                      MIP_GAP,
         "time_limit_s":                 TIME_LIMIT_S,
         "altitude_max_repeat_days":     ALTITUDE_MAX_REPEAT_DAYS,
-        "seeds_for_milp_by_r_required": SEEDS_FOR_MILP_BY_R_REQUIRED,
         "dt_s":                         DT_S,
         "detection_time_s":             detection_time_s,
         "decision_time_s":              decision_time_s,
@@ -365,9 +359,19 @@ def main(dry_run: bool = False, stagger_seconds: int = 0, stagger_count: int = 1
             f"_dt{int(detect_s)}"
             f"_dc{int(decide_s)}"
             f"_bt{int(burnout_s)}"
-            f"_ag{a_g_val:.1f}"
+            f"_ag{a_g_val:.1f}".replace(".", "p")
         )
-        # AWS Batch job names must match [a-zA-Z0-9_-] and be ≤128 chars
+        # AWS Batch job names must match [a-zA-Z0-9_-] and be <=128 chars.
+        # a_g's decimal point is handled above ("10.0" -> "10p0") since "p" is
+        # more legible than a blanket substitution there. Everything else --
+        # in particular target_slug, which comes from a free-text target/point
+        # name (country names are safe, but a prespecified point's name can
+        # contain parentheses, commas, etc. -- confirmed to break job
+        # submission with a real Russian target set) -- is caught by this
+        # final whitelist substitution instead of trying to blacklist every
+        # punctuation character that might show up in a target name.
+        job_name = re.sub(r"[^A-Za-z0-9_-]", "-", job_name)
+        job_name = re.sub(r"-{2,}", "-", job_name)
         job_name = job_name[:128]
 
         combo_run_name = f"{RUN_NAME}_{idx}" if RUN_NAME else None

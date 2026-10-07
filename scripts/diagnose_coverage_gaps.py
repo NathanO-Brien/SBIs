@@ -89,7 +89,7 @@ def main() -> None:
         horizon_s=                float(s["horizon_s"]),
         dt_s=                     float(s["dt_s"]),
         analysis_matrix_dtype=    str(s.get("analysis_matrix_dtype", "uint8")),
-        use_j2=                   bool(s.get("use_j2", True)),
+        use_j2=                   bool(s.get("use_j2", False)),
         use_drag=                 bool(s.get("use_drag", False)),
     )
 

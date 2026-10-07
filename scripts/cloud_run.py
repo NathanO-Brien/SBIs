@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import re
 
 import boto3
 
@@ -984,6 +985,14 @@ def main() -> None:
         f"_i{args.interceptors}"
         f"_v{args.vbo:.0f}"
     )
+    # AWS Batch job names must match [a-zA-Z0-9_-] and be <=128 chars. `slug`
+    # comes from a free-text country/target-point name and can contain
+    # punctuation (parentheses, commas, etc.) that isn't in that character
+    # set -- confirmed to break job submission with a real prespecified
+    # target set. Sanitize with a whitelist rather than trying to blacklist
+    # every punctuation character that might show up in a target name.
+    job_name = re.sub(r"[^A-Za-z0-9_-]", "-", job_name)
+    job_name = re.sub(r"-{2,}", "-", job_name)
     job_name = job_name[:128]
 
     cfg = {
