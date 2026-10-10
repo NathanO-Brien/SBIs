@@ -322,3 +322,24 @@ def list_recent_jobs(batch, queue: str = JOB_QUEUE, statuses: Iterable[str] = JO
 
 def _ms(v) -> datetime.datetime | None:
     return datetime.datetime.fromtimestamp(v / 1000.0, tz=datetime.timezone.utc) if v else None
+
+
+def country_targets(countries: Sequence[str], n_points: int, intercept_alt_km: float = 200.0) -> list[list]:
+    """Target points ([[name, lat, lon], ...]) that country mode would use: the Fibonacci globe points inside the countries.
+
+    Raises InputProblems when the boundary data is unavailable, a name is unknown, or no point falls inside.
+    """
+    from ..core.config import EarthConstants
+    from ..core.shell import Shell
+    if not countries:
+        raise InputProblems(["Pick at least one country."])
+    try:
+        sh = Shell(EarthConstants(), n_points=int(n_points), shell_alt_km=float(intercept_alt_km)).mask_country(list(countries))
+    except ImportError:
+        raise InputProblems(["Country masking needs geopandas (pip install geopandas shapely pyogrio) and internet access for boundary data."]) from None
+    except Exception as exc:
+        raise InputProblems([f"Could not mask the globe to {', '.join(countries)}: {exc}"]) from None
+    if sh.n_points_used == 0:
+        raise InputProblems([f"No globe points fall inside {', '.join(countries)} with {int(n_points)} points. Increase 'Globe points'."])
+    label = ", ".join(countries)
+    return [[f"{label} target {i}", float(la), float(lo)] for i, (la, lo) in enumerate(zip(sh.lat_deg, sh.lon_deg))]

@@ -1,0 +1,10 @@
+# Streamlit settings for scripts/sbi_gui.py (run `streamlit run scripts/sbi_gui.py` from the repo root).
+[theme]
+primaryColor = "#2f6fed"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false
