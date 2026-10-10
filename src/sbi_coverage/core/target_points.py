@@ -73,26 +73,3 @@ def load_target_points_csv(path: str | Path) -> list[list]:
     if not points:
         raise ValueError(f"load_target_points_csv: {path} contains no data rows")
     return points
-
-
-def smart_inclination_bounds(target_points: list) -> tuple[float, float]:
-    """Inclination sweep floor computed from a prespecified target-point set.
-
-    An orbit at inclination i can only reach absolute latitudes <= i (an
-    inclination lower than the closest-to-equator target's absolute latitude
-    can never cover that target at all), so the lowest inclination worth
-    considering is (that target's absolute latitude - a 5 deg margin),
-    floored at 0. Upper bound is always 90 (polar). Uses abs() so this is
-    correct for southern-hemisphere or mixed-hemisphere target sets, not
-    just the northern-hemisphere case it was first requested for.
-
-    Mirrors, for prespecified sets, what the hand-curated per-country
-    inclination-bounds dictionaries already do for country mode (both exist
-    to avoid wasting the seed search on inclinations that can never reach
-    the target) -- this version computes it directly from the actual points
-    instead of a hand-curated lookup.
-    """
-    if not target_points:
-        raise ValueError("smart_inclination_bounds: target_points must be non-empty")
-    lo = max(0.0, min(abs(float(p[1])) for p in target_points) - 5.0)
-    return (lo, 90.0)

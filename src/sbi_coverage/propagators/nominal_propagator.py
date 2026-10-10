@@ -1,6 +1,6 @@
 """Nominal analytical propagator: Keplerian two-body motion with optional
-J2 secular drift (RAAN and argument of perigee rates) and an optional
-averaged exponential-atmosphere drag model.
+J2 secular drift (RAAN, argument of perigee, and Lee's J2-corrected mean-anomaly
+rate) and an optional averaged exponential-atmosphere drag model.
 
 Implements the propagator interface expected by simulate.run_simulation():
 init_state() and step_state_to_eci_positions().
@@ -84,6 +84,23 @@ def j2_secular_rates_rad_s(a_km, e, i_rad, earth: EarthConstants) -> tuple[np.nd
     Omegadot = -fac * np.cos(i_rad)
     omegadot = 0.5 * fac * (5.0 * np.cos(i_rad) ** 2 - 1.0)
     return Omegadot, omegadot
+
+
+def lee_mean_anomaly_rate_rad_s(a_km, e, i_rad, earth: EarthConstants) -> np.ndarray:
+    """
+    J2-corrected mean-anomaly rate (Lee et al. 2020, Eq. 5):
+
+        Mdot = n * [1 - 1.5 * J2 * (Re/p)^2 * sqrt(1 - e^2) * (1.5 sin^2 i - 1)]
+
+    with p = a (1 - e^2).  Together with the J2 secular rates of RAAN and argument
+    of perigee (j2_secular_rates_rad_s), this closes the ground track exactly
+    under the secular J2 model: the argument-of-latitude rate of a circular orbit
+    is omegadot + Mdot.
+    """
+    n = mean_motion_rad_s(a_km, earth.mu_km3_s2)
+    p = a_km * (1.0 - e * e)
+    k = 1.5 * earth.j2 * (earth.r_eq_km / np.maximum(p, 1e-9)) ** 2
+    return n * (1.0 - k * np.sqrt(1.0 - e * e) * (1.5 * np.sin(i_rad) ** 2 - 1.0))
 
 
 def density_exponential_kg_m3(h_km: np.ndarray, sim: SimConfig) -> np.ndarray:
@@ -195,9 +212,14 @@ def step_state_to_eci_positions(
         state.raan_rad = state.raan_rad + Omegadot * dt_s
         state.argp_rad = state.argp_rad + omegadot * dt_s
 
-    # Mean anomaly update (with updated a(t))
-    n = mean_motion_rad_s(state.a_km, earth.mu_km3_s2)
-    state.M_rad = state.M_rad + n * dt_s
+    # Mean anomaly update (with updated a(t)).  With J2 on, use Lee's corrected
+    # mean-anomaly rate (Eq. 5) so ground-track closure is exact; J2 off keeps the
+    # plain two-body mean motion.
+    if use_j2:
+        Mdot = lee_mean_anomaly_rate_rad_s(state.a_km, state.e, state.i_rad, earth)
+    else:
+        Mdot = mean_motion_rad_s(state.a_km, earth.mu_km3_s2)
+    state.M_rad = state.M_rad + Mdot * dt_s
     state.M_rad = (state.M_rad + np.pi) % (2.0 * np.pi) - np.pi
 
     # Kepler solve -> true anomaly

@@ -7,7 +7,7 @@ import numpy as np
 import scipy.sparse as sp
 
 
-def build_param_V(v0_list: list[np.ndarray]) -> sp.csr_matrix:
+def build_param_V(v0_list: list[np.ndarray], n_cols_per_seed: list[int] | None = None) -> sp.csr_matrix:
     """Build the MILP constraint matrix param_V from seed access profiles.
 
     Each element of ``v0_list`` is the binary access profile of one seed
@@ -22,11 +22,21 @@ def build_param_V(v0_list: list[np.ndarray]) -> sp.csr_matrix:
         Binary access profiles. ``v0_list[s][t, j] = 1`` if the seed satellite
         of sub-constellation ``s`` can engage target ``j`` at time step ``t``.
 
+    n_cols_per_seed : list of int, optional
+        Number of slot columns kept for each seed (default: L for every seed).
+        A family whose ratio N_P:N_D is not in lowest terms (g = gcd > 1) has a
+        ground track that repeats every T_r/g, so only the first L//g slots are
+        distinct satellite positions; the other slots repeat them.  Passing
+        L//g for such a seed drops the repeats (the block becomes L x (L//g),
+        each kept column still an exact circular shift of its seed profile).
+        Row structure, and hence the shared-repeat-period requirement, is
+        unchanged.  Column order: seed 0 slots 0..m_0-1, then seed 1, ...
+
     Returns
     -------
-    scipy.sparse.csr_matrix, shape (L * nTargets, n_seeds * L)
-        Stacked circulant constraint matrix with one L-column block per seed
-        family.
+    scipy.sparse.csr_matrix, shape (L * nTargets, sum(n_cols_per_seed))
+        Stacked circulant constraint matrix with one column block per seed
+        family (L columns each unless n_cols_per_seed says otherwise).
     """
     if not v0_list:
         raise ValueError("build_param_V: v0_list must contain at least one array")
@@ -40,15 +50,20 @@ def build_param_V(v0_list: list[np.ndarray]) -> sp.csr_matrix:
             )
 
     n_seeds = len(v0_list)
+    if n_cols_per_seed is None:
+        n_cols_per_seed = [L] * n_seeds
+    if len(n_cols_per_seed) != n_seeds or any(not (1 <= m <= L) for m in n_cols_per_seed):
+        raise ValueError(f"build_param_V: n_cols_per_seed must have {n_seeds} entries in [1, {L}]")
+    col_offsets = np.concatenate([[0], np.cumsum(n_cols_per_seed)]).astype(np.int64)
     n_rows = L * n_targets
-    n_cols = n_seeds * L
-    k_idx = np.arange(L, dtype=np.int32)
+    n_cols = int(col_offsets[-1])
 
     row_chunks: list[np.ndarray] = []
     col_chunks: list[np.ndarray] = []
 
     for s, v0 in enumerate(v0_list):
-        col_offset = s * L
+        col_offset = int(col_offsets[s])
+        k_idx = np.arange(n_cols_per_seed[s], dtype=np.int32)
         v0 = np.asarray(v0, dtype=np.uint8)
         for j in range(n_targets):
             row_offset = j * L

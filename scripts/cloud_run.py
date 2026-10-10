@@ -9,10 +9,10 @@ submits one AWS Batch job pointing at batch_worker.py, and prints the job ID.
 No computation is done locally.
 
 Usage (country mode):
-    python scripts/cloud_run.py --country China --altitude 250 --salvo 1 --interceptors 1 --vbo 4.0
+    python scripts/cloud_run.py --country China --salvo 1 --interceptors 1 --vbo 4.0
 
 Usage (prespecified mode):
-    python scripts/cloud_run.py --target-points "NK: Yongbyon,39.79,125.66" --altitude 250 --salvo 1 --interceptors 1 --vbo 4.0
+    python scripts/cloud_run.py --target-points "NK: Yongbyon,39.79,125.66" --salvo 1 --interceptors 1 --vbo 4.0
 
 Optional arguments mirror lee_test2.py defaults â€” edit the constants below
 to change defaults without having to pass flags every time.
@@ -26,7 +26,8 @@ import re
 
 import boto3
 
-from sbi_coverage.core.target_points import load_target_points_csv, smart_inclination_bounds
+from sbi_coverage.core.target_points import load_target_points_csv
+from sbi_coverage.runnames import scenario_from_path, settings_from_config, settings_key
 
 # ---------------------------------------------------------------------------
 # AWS / S3 configuration
@@ -46,11 +47,6 @@ AWS_REGION:       str = "us-east-1"
 TARGET_MODE:            str   = "prespecified"  # "country" or "prespecified"
 TARGET_COUNTRY:         str   = "China"
 TARGET_SHELL_N_POINTS:  int   = 15000
-INCLINATION_SWEEP_BOUNDS_DEG: dict[str, tuple[float, float]] = {
-    "China":       (20.0, 90.0),
-    "North Korea": (35.0, 90.0),
-}
-DEFAULT_INCLINATION_BOUNDS: tuple[float, float] = (0, 90.0)
 
 # Two advisor-provided target-region blobs (lasso-selected on a
 # Mollweide projection, Fibonacci-sphere shell N=15000): BLOB1 (73 points,
@@ -833,18 +829,20 @@ A_G:                float = 10.0
 INTERCEPT_ALT_KM:   float = 200.0
 MIN_ELEV_DEG:       float = 0.0
 
-# Orbit
-TARGET_ALTITUDE_KM:       float = 400.0  # required; snapped to the nearest RGT orbit
-ALTITUDE_MAX_REPEAT_DAYS: int   = 2
+# Orbit / seed families (Lee exact J2).  Altitude and inclination are NOT inputs:
+# batch_worker.py derives synchronized seed families from the target latitudes
+# (anchor = highest-latitude family; upper altitude bound = intercept alt + R_max).
+ND_REPEAT:             int   = 3
+ALTITUDE_MIN_KM:       float = 200.0
+ANCHOR_LAT_MARGIN_DEG: float = 0.0
 
 # Seed grid
 DT_S:               float = 120.0
-INC_SCREEN_STEP_DEG: float = 1.0
-N_RAAN_OFFSETS:     int   = 10
+RAAN_STEP_DEG:      float = 0.25
 SEED_WORKERS:       int   = 8
 # n_seeds_for_milp is intentionally not exposed here -- batch_worker.py's
-# config schema now defaults to the rarity-weighted, margin-driven build +
-# trim seed selection (margin_multiplier=3.0, trim_margin_multiplier=1.25,
+# config schema now defaults to the worst-case-first, margin-driven build +
+# trim seed selection (margin_multiplier=5.0, trim_margin_multiplier=2.0,
 # etc.) when these keys are absent from the uploaded config, which is what
 # omitting the old fixed seed count here achieves. The schema still accepts
 # overrides for these; re-add CLI flags below if per-run tuning is worth
@@ -898,7 +896,6 @@ def main() -> None:
     )
 
     # Engagement
-    parser.add_argument("--target-altitude", required=True, type=float, help="Target orbit altitude in km (required); snapped to the nearest RGT orbit")
     parser.add_argument("--salvo",        default=SALVO_SIZE,          type=int,   help=f"Salvo size (default: {SALVO_SIZE})")
     parser.add_argument("--interceptors", default=N_INTERCEPTORS_PER_SAT, type=int, help=f"Interceptors per satellite (default: {N_INTERCEPTORS_PER_SAT})")
     parser.add_argument("--vbo",          default=V_BO_KM_S,           type=float, help=f"Burnout velocity in km/s (default: {V_BO_KM_S})")
@@ -910,14 +907,13 @@ def main() -> None:
     parser.add_argument("--min-elev",     default=MIN_ELEV_DEG,        type=float, help=f"Min elevation angle in deg (default: {MIN_ELEV_DEG})")
 
     # Orbit
-    parser.add_argument("--altitude-max-repeat-days", default=ALTITUDE_MAX_REPEAT_DAYS, type=int,   help=f"Max RGT repeat days (default: {ALTITUDE_MAX_REPEAT_DAYS})")
-    parser.add_argument("--inc-bounds",   default=None, nargs=2, type=float, metavar=("LO", "HI"),
-                        help="Inclination sweep bounds in deg (default: per-country, or geometry-aware for prespecified)")
+    parser.add_argument("--nd-repeat",    default=ND_REPEAT,           type=int,   help=f"Days in the shared repeat period N_D (default: {ND_REPEAT})")
+    parser.add_argument("--altitude-min", default=ALTITUDE_MIN_KM,     type=float, help=f"Lower altitude bound in km; the upper bound is intercept alt + R_max (default: {ALTITUDE_MIN_KM})")
+    parser.add_argument("--anchor-lat-margin", default=ANCHOR_LAT_MARGIN_DEG, type=float, help=f"Anchor inclination = highest target latitude minus this, deg (default: {ANCHOR_LAT_MARGIN_DEG})")
 
     # Seed grid
     parser.add_argument("--dt",           default=DT_S,                type=float, help=f"Time step in s (default: {DT_S})")
-    parser.add_argument("--inc-step",     default=INC_SCREEN_STEP_DEG, type=float, help=f"Inclination step in deg (default: {INC_SCREEN_STEP_DEG})")
-    parser.add_argument("--n-raan",       default=N_RAAN_OFFSETS,      type=int,   help=f"RAAN offsets per inclination (default: {N_RAAN_OFFSETS})")
+    parser.add_argument("--raan-step",    default=RAAN_STEP_DEG,       type=float, help=f"RAAN spacing between seeds of a family, deg (default: {RAAN_STEP_DEG})")
     parser.add_argument("--seed-workers", default=SEED_WORKERS,        type=int,   help=f"Parallel seed workers (default: {SEED_WORKERS})")
     parser.add_argument("--n-points",     default=TARGET_SHELL_N_POINTS, type=int, help=f"Target shell points (country mode, default: {TARGET_SHELL_N_POINTS})")
 
@@ -927,6 +923,8 @@ def main() -> None:
 
     # Run metadata
     parser.add_argument("--run-name", default=RUN_NAME, help="Optional run name, saved into the output JSON only")
+    parser.add_argument("--scenario", default=None, help="Short scenario code for the run name, e.g. NK, CN (inferred from the CSV path or country if omitted)")
+    parser.add_argument("--test-run", action="store_true", help="Mark as a test run: run name gets a TEST- prefix, hidden by default in the run browser")
     parser.add_argument("--principal-set", action="store_true", default=IS_PRINCIPAL_SET, help="Mark this run as part of a principal research set")
 
     # AWS
@@ -941,9 +939,6 @@ def main() -> None:
         target_mode = "country"
         country     = args.country
         target_points = None
-        inc_bounds = list(args.inc_bounds) if args.inc_bounds else list(
-            INCLINATION_SWEEP_BOUNDS_DEG.get(country, DEFAULT_INCLINATION_BOUNDS)
-        )
         slug = country.lower().replace(" ", "-")
     elif args.target_points:
         target_mode   = "prespecified"
@@ -955,32 +950,25 @@ def main() -> None:
                 raise ValueError(f"--target-points entries must be 'Name,lat,lon', got: {entry!r}")
             name, lat, lon = parts[0].strip(), float(parts[1]), float(parts[2])
             target_points.append([name, lat, lon])
-        inc_bounds = list(args.inc_bounds) if args.inc_bounds else list(smart_inclination_bounds(target_points))
         slug = target_points[0][0].lower().replace(" ", "-").replace(":", "").replace("/", "-")[:20]
     elif args.target_points_csv:
         target_mode   = "prespecified"
         country       = None
         target_points = load_target_points_csv(args.target_points_csv)
-        inc_bounds = list(args.inc_bounds) if args.inc_bounds else list(smart_inclination_bounds(target_points))
         slug = target_points[0][0].lower().replace(" ", "-").replace(":", "").replace("/", "-")[:20]
     elif TARGET_MODE == "country":
         target_mode   = "country"
         country       = TARGET_COUNTRY
         target_points = None
-        inc_bounds = list(args.inc_bounds) if args.inc_bounds else list(
-            INCLINATION_SWEEP_BOUNDS_DEG.get(country, DEFAULT_INCLINATION_BOUNDS)
-        )
         slug = country.lower().replace(" ", "-")
     else:
         target_mode   = "prespecified"
         country       = None
         target_points = TARGET_POINTS
-        inc_bounds = list(args.inc_bounds) if args.inc_bounds else list(smart_inclination_bounds(target_points))
         slug = "pacific-3-blobs"
 
     job_name = args.job_name or (
         f"run_{ts}_{slug}"
-        f"_alt{int(args.target_altitude)}km"
         f"_s{args.salvo}"
         f"_i{args.interceptors}"
         f"_v{args.vbo:.0f}"
@@ -999,13 +987,14 @@ def main() -> None:
         # Run metadata
         "run_name":                     args.run_name,
         "is_principal_set":             args.principal_set,
+        "is_test_run":                  args.test_run,
+        "scenario":                     args.scenario or (scenario_from_path(args.target_points_csv) if args.target_points_csv else None),
         # Target
         "job_name":                     job_name,
         "target_mode":                  target_mode,
         "target_country":               country,
         "target_points":                target_points,
         "target_shell_n_points":        args.n_points if target_mode == "country" else None,
-        "inclination_sweep_bounds_deg": inc_bounds,
         # Engagement
         "v_bo_km_s":                    args.vbo,
         "salvo_size":                   args.salvo,
@@ -1016,13 +1005,13 @@ def main() -> None:
         "a_g":                          args.a_g,
         "intercept_alt_km":             args.intercept_alt,
         "min_elev_deg":                 args.min_elev,
-        # Orbit
-        "target_altitude_km":           args.target_altitude,
-        "altitude_max_repeat_days":     args.altitude_max_repeat_days,
+        # Orbit / seed families (Lee exact J2)
+        "nd_repeat":                    args.nd_repeat,
+        "altitude_min_km":              args.altitude_min,
+        "anchor_lat_margin_deg":        args.anchor_lat_margin,
         # Seed grid
         "dt_s":                         args.dt,
-        "inc_screen_step_deg":          args.inc_step,
-        "n_raan_offsets":               args.n_raan,
+        "raan_step_deg":                args.raan_step,
         "seed_workers":                 args.seed_workers,
         # Solver
         "mip_gap":                      args.mip_gap,
@@ -1034,6 +1023,8 @@ def main() -> None:
 
     print(f"Uploading config to {s3_config_uri} ...")
     s3 = boto3.client("s3", region_name=AWS_REGION)
+    _key = settings_key(settings_from_config(cfg))
+    print(f"Run identity: {_key}  (date and sequence letter are added by the worker)")
     s3.put_object(Body=json.dumps(cfg, indent=2).encode("utf-8"), Bucket=S3_BUCKET, Key=config_key)
 
     print(f"Submitting Batch job: {job_name}")

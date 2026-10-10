@@ -13,8 +13,8 @@ Edit the SWEEP_* constants below to define the parameter grid, then run:
 
     python scripts/cloud_sweep.py
 
-Results land in S3 under automatically-generated hierarchical prefixes, one
-per combination, matching the structure used by batch_worker.py.
+Results land flat in S3 runs/ with a short decodable name per combination
+(see sbi_coverage.runnames).
 
 To dry-run without submitting jobs (prints what would be submitted):
     python scripts/cloud_sweep.py --dry-run
@@ -31,7 +31,9 @@ from pathlib import Path
 
 import boto3
 
-from sbi_coverage.core.target_points import load_target_points_csv, smart_inclination_bounds
+from sbi_coverage.core.target_points import load_target_points_csv
+from sbi_coverage.runnames import (decode_run_name, scenario_from_path, settings_from_config,
+                                    settings_key)
 
 # ---------------------------------------------------------------------------
 # AWS / S3 configuration — edit to match your deployment
@@ -48,12 +50,16 @@ AWS_REGION:         str = "us-east-1"
 TARGET_SHELL_N_POINTS:      int   = 15000
 MIP_GAP:                    float = 0
 TIME_LIMIT_S:               float = 14400.0
-ALTITUDE_MAX_REPEAT_DAYS:   int   = 2
+# Seed families (Lee exact J2): altitude/inclination are derived by batch_worker.py
+# from the target latitudes (anchor = highest-latitude family; upper altitude
+# bound = intercept alt + R_max), so there is no altitude or inclination input.
+ND_REPEAT:                  int   = 3
+ALTITUDE_MIN_KM:            float = 200.0
+ANCHOR_LAT_MARGIN_DEG:      float = 0.0
+RAAN_STEP_DEG:              float = 0.25
 DT_S:                       float = 120.0
 INTERCEPT_ALT_KM:           float = 200.0
 MIN_ELEV_DEG:               float = 0.0
-INC_SCREEN_STEP_DEG:        float = 1.0
-N_RAAN_OFFSETS:             int   = 10
 SEED_WORKERS:               int   = 8
 # mip_focus/heuristics_frac/solver_params are intentionally not exposed here
 # -- batch_worker.py's config schema defaults to vanilla Gurobi tuning
@@ -75,17 +81,6 @@ TARGET_POINTS: list[list] = [
 # loading a CSV -- see sbi_coverage.core.target_points.load_target_points_csv.
 TARGET_POINTS_CSV: str | Path | None = r"C:\Users\natha\OneDrive\Documents\GT 2026 Fall Semester\Research\Principle Sets\CN\Prespecified_100_ICBMS_CN_High_Priority.csv"
 
-# Per-country inclination sweep bounds — lower bound ≈ minimum latitude of
-# interest for each country, matching sweep_optimize.py. Prespecified mode
-# instead computes its bounds dynamically via smart_inclination_bounds().
-INCLINATION_SWEEP_BOUNDS_DEG: dict[str, tuple[float, float]] = {
-    "China":       (20.0, 90.0),
-    "North Korea": (35.0, 90.0),
-    "Russia":      (40.0, 90.0),
-    "Iran":        (20.0, 90.0)
-}
-DEFAULT_INCLINATION_BOUNDS: tuple[float, float] = (0, 90.0)
-
 # ---------------------------------------------------------------------------
 # Run metadata (optional; saved into the output JSON only -- never used for
 # job/config naming, which is unaffected by these). Each combo's saved
@@ -93,13 +88,20 @@ DEFAULT_INCLINATION_BOUNDS: tuple[float, float] = (0, 90.0)
 # ---------------------------------------------------------------------------
 RUN_NAME: str | None = "Prespecified_100_ICBMS_CN_High_Priority_PRINCIPAL"
 IS_PRINCIPAL_SET: bool = True
+# Existence check. False (default): every combination is submitted, layering new runs on top of
+# whatever is already in runs/ (same-day reruns get the next sequence letter). True: skip a combo
+# whose run identity (see sbi_coverage.runnames.settings_key, any date) already exists in S3.
+# The --skip-existing command-line flag turns this on for one launch.
+SKIP_EXISTING: bool = False
+# Short scenario code used in run names (e.g. "CN"). None -> inferred from the CSV path
+# (a "CN"/"NK"/... folder) or, in country mode, from the country name.
+SCENARIO: str | None = None
 
 # ---------------------------------------------------------------------------
 # Sweep grid — mirrors sweep_optimize.py defaults.
 # Change these lists to define the combinations you want to run.
 # ---------------------------------------------------------------------------
 SWEEP_COUNTRIES:                list[str]   = []
-SWEEP_ALTITUDES_KM:             list[float] = [400.0]
 SWEEP_SALVO_SIZES:              list[int]   = [100]
 SWEEP_INTERCEPTORS_PER_SAT:     list[int]   = [1, 2, 3, 4, 5, 6]
 SWEEP_BURNOUT_VELOCITIES_KM_S:  list[float] = [4.0, 6.0]
@@ -110,13 +112,13 @@ SWEEP_DETECTION_TIMES_S:        list[float] = [0.0, 15.0, 30.0, 45.0]
 SWEEP_DECISION_TIMES_S:         list[float] = [0.0]
 SWEEP_BURNOUT_TIMES_S:          list[float] = [170.0]
 SWEEP_A_G_LIST:                 list[float] = [10.0]
-# margin_multiplier/trim_margin_multiplier/max_seeds_safety_cap/polar_band_deg/
-# polar_band_divisor (the rarity-weighted, margin-driven build+trim seed
-# selection -- see sweep_optimize.py/lee_test2.py) are intentionally not
+# margin_multiplier/trim_margin_multiplier/max_seeds_safety_cap (the
+# worst-case-first, margin-driven build+trim seed selection -- see
+# lee_test2.py / sbi_coverage.Lee.seed_pipeline) are intentionally not
 # exposed here -- batch_worker.py's config schema already defaults to the
-# same values (3.0/1.25/200/[70,90]/5.0) when these keys are absent from the
-# uploaded config, which is what omitting them here achieves. The schema
-# still accepts them if per-sweep overrides are worth reintroducing.
+# same values (5.0/2.0/200) when these keys are absent from the uploaded
+# config, which is what omitting them here achieves. The schema still accepts
+# them if per-sweep overrides are worth reintroducing.
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -132,8 +134,6 @@ def _config_for(
     target_mode: str,
     country: str | None,
     target_points: list | None,
-    inc_bounds: tuple[float, float],
-    altitude_km: float,
     salvo_size: int,
     n_interceptors_per_sat: int,
     v_bo_km_s: float,
@@ -150,18 +150,19 @@ def _config_for(
         "job_name":                     job_name,
         "run_name":                     run_name,
         "is_principal_set":             is_principal_set,
+        "scenario":                     SCENARIO or (scenario_from_path(TARGET_POINTS_CSV) if TARGET_POINTS_CSV and target_mode == "prespecified" else None),
         "target_mode":                  target_mode,
         "target_country":               country if target_mode == "country" else None,
         "target_points":                target_points if target_mode == "prespecified" else None,
         "target_shell_n_points":        TARGET_SHELL_N_POINTS if target_mode == "country" else None,
-        "target_altitude_km":           altitude_km,
-        "inclination_sweep_bounds_deg": list(inc_bounds),
         "v_bo_km_s":                    v_bo_km_s,
         "salvo_size":                   salvo_size,
         "n_interceptors_per_sat":       n_interceptors_per_sat,
         "mip_gap":                      MIP_GAP,
         "time_limit_s":                 TIME_LIMIT_S,
-        "altitude_max_repeat_days":     ALTITUDE_MAX_REPEAT_DAYS,
+        "nd_repeat":                    ND_REPEAT,
+        "altitude_min_km":              ALTITUDE_MIN_KM,
+        "anchor_lat_margin_deg":        ANCHOR_LAT_MARGIN_DEG,
         "dt_s":                         DT_S,
         "detection_time_s":             detection_time_s,
         "decision_time_s":              decision_time_s,
@@ -169,57 +170,32 @@ def _config_for(
         "a_g":                          a_g,
         "intercept_alt_km":             INTERCEPT_ALT_KM,
         "min_elev_deg":                 MIN_ELEV_DEG,
-        "inc_screen_step_deg":          INC_SCREEN_STEP_DEG,
-        "n_raan_offsets":               N_RAAN_OFFSETS,
+        "raan_step_deg":                RAAN_STEP_DEG,
         "seed_workers":                 SEED_WORKERS,
     }
 
 
-def _results_exist(
-    s3: "boto3.client", bucket: str, *, target_mode: str, country: str | None,
-    target_points: list | None, altitude_km: float, salvo: int, n_int: int, v_bo: float,
-    detection_time_s: float, decision_time_s: float,
-    target_missile_burnout_time_s: float, a_g: float,
-) -> bool:
-    """Return True if a .csv result file already exists in S3 for this combination.
+def _results_exist(s3: "boto3.client", bucket: str, cfg: dict) -> bool:
+    """True if a lee_j2 result with the same run identity (any date) is already in S3.
 
-    Checks burnout vel, interceptors, salvo, intercept alt, orbit altitude, AND
-    (item 9) the burnout/detection/decision-time and max-accel segments -- once
-    those can vary per combo, omitting them here would falsely treat combos
-    that only differ in one of these as duplicates of each other.
-    The snapped orbit altitude may differ slightly from the requested one, so we
-    match on a rounded integer (e.g. 'orbit-alt-400km') — sufficient because
-    sweep altitudes are spaced further apart than snapping precision.
+    Run names are flat under runs/ (see sbi_coverage.runnames): the identity is the
+    readable settings tokens plus a hash of everything else, so a run made with a
+    different RAAN step, margin, target set, ... is correctly NOT a duplicate. Results
+    from the older J2-off pipeline live under country/ and prespecified/ (archived) and
+    can never match.
     """
-    if target_mode == "prespecified":
-        pts = target_points or []
-        first_name = str(pts[0][0]).strip().lower().replace(" ", "-").replace(":", "").replace("/", "-") if pts else "prespecified"
-        broad_prefix = f"prespecified/{first_name[:40]}/"
-    else:
-        country_slug = (country or "").lower().replace(" ", "-")
-        broad_prefix = f"country/{country_slug}/"
-    intercept_alt = round(INTERCEPT_ALT_KM)
-    t_window      = round(target_missile_burnout_time_s)
-    detect_time   = round(detection_time_s)
-    decide_time   = round(decision_time_s)
-    paginator = s3.get_paginator("list_objects_v2")
-    alt_candidates = {f"orbit-alt-{int(round(altitude_km + d))}km" for d in range(-15, 16)}
-    for page in paginator.paginate(Bucket=bucket, Prefix=broad_prefix):
+    key = settings_key(settings_from_config(cfg))
+    head = key.rsplit("-", 1)[0] + "-"          # readable tokens; the date follows
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=f"runs/{head[:head.index('-i')]}"):
         for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if (
-                key.endswith(".csv")
-                and any(cand + "/" in key for cand in alt_candidates)
-                and f"burnout-vel-{v_bo:.1f}km-s/" in key
-                and f"interceptors-per-sat-{n_int}/" in key
-                and f"salvo-size-{salvo}/" in key
-                and f"intercept-alt-{intercept_alt}km/" in key
-                and f"intercept-window-{t_window}s/" in key
-                and f"detection-time-{detect_time}s/" in key
-                and f"decision-time-{decide_time}s/" in key
-                and f"max-accel-{a_g:.1f}g/" in key
-            ):
-                return True
+            fn = obj["Key"].rsplit("/", 1)[-1]
+            if not fn.endswith("_result.json"):
+                continue
+            try:
+                if decode_run_name(fn)["key"] == key:
+                    return True
+            except ValueError:
+                continue
     return False
 
 
@@ -255,7 +231,8 @@ def _submit_job(
 # Main
 # ---------------------------------------------------------------------------
 
-def main(dry_run: bool = False, stagger_seconds: int = 0, stagger_count: int = 10) -> None:
+def main(dry_run: bool = False, stagger_seconds: int = 0, stagger_count: int = 10,
+         skip_existing: bool = SKIP_EXISTING) -> None:
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
     sweep_tag = _sweep_tag(ts)
 
@@ -265,14 +242,12 @@ def main(dry_run: bool = False, stagger_seconds: int = 0, stagger_count: int = 1
     # prespecified sets, and none was requested).
     if TARGET_MODE == "prespecified":
         fixed_target_points = load_target_points_csv(TARGET_POINTS_CSV) if TARGET_POINTS_CSV else TARGET_POINTS
-        fixed_inc_bounds = smart_inclination_bounds(fixed_target_points)
         fixed_target_slug = (
             str(fixed_target_points[0][0]).strip().lower()
             .replace(" ", "-").replace(":", "").replace("/", "-")
         )[:20]
     else:
         fixed_target_points = None
-        fixed_inc_bounds = None
         fixed_target_slug = None
 
     # Grid as a list of per-combo dicts rather than positional tuples --
@@ -282,7 +257,6 @@ def main(dry_run: bool = False, stagger_seconds: int = 0, stagger_count: int = 1
     if TARGET_MODE == "country":
         dims["country"] = SWEEP_COUNTRIES
     dims.update({
-        "altitude_km":                    SWEEP_ALTITUDES_KM,
         "salvo_size":                     SWEEP_SALVO_SIZES,
         "n_interceptors_per_sat":         SWEEP_INTERCEPTORS_PER_SAT,
         "v_bo_km_s":                      SWEEP_BURNOUT_VELOCITIES_KM_S,
@@ -313,9 +287,11 @@ def main(dry_run: bool = False, stagger_seconds: int = 0, stagger_count: int = 1
         print(f"  Stagger            : {stagger_seconds}s delay between first {stagger_count} submissions")
     print("=" * 70)
 
+    if not dry_run or skip_existing:
+        s3 = boto3.client("s3", region_name=AWS_REGION)
     if not dry_run:
-        s3    = boto3.client("s3",    region_name=AWS_REGION)
         batch = boto3.client("batch", region_name=AWS_REGION)
+    print(f"  Skip existing      : {skip_existing}")
 
     submitted: list[dict] = []
     skipped:   list[dict] = []
@@ -325,17 +301,14 @@ def main(dry_run: bool = False, stagger_seconds: int = 0, stagger_count: int = 1
         if TARGET_MODE == "country":
             country       = combo["country"]
             target_points = None
-            inc_bounds    = INCLINATION_SWEEP_BOUNDS_DEG.get(country, DEFAULT_INCLINATION_BOUNDS)
             target_slug   = country.lower().replace(" ", "-")
             target_label  = country
         else:
             country       = None
             target_points = fixed_target_points
-            inc_bounds    = fixed_inc_bounds
             target_slug   = fixed_target_slug
             target_label  = fixed_target_slug
 
-        alt_km    = combo["altitude_km"]
         salvo     = combo["salvo_size"]
         n_int     = combo["n_interceptors_per_sat"]
         v_bo      = combo["v_bo_km_s"]
@@ -352,7 +325,6 @@ def main(dry_run: bool = False, stagger_seconds: int = 0, stagger_count: int = 1
         job_name = (
             f"{sweep_tag}"
             f"_{target_slug}"
-            f"_alt{int(alt_km)}km"
             f"_s{salvo}"
             f"_i{n_int}"
             f"_v{v_bo:.0f}"
@@ -381,8 +353,6 @@ def main(dry_run: bool = False, stagger_seconds: int = 0, stagger_count: int = 1
             target_mode=TARGET_MODE,
             country=country,
             target_points=target_points,
-            inc_bounds=inc_bounds,
-            altitude_km=alt_km,
             salvo_size=salvo,
             n_interceptors_per_sat=n_int,
             v_bo_km_s=v_bo,
@@ -397,26 +367,20 @@ def main(dry_run: bool = False, stagger_seconds: int = 0, stagger_count: int = 1
 
         label = (
             f"[{idx:3d}/{n_total}]  {target_label:<12}  "
-            f"alt={alt_km:.0f}km  salvo={salvo:<4}  int/sat={n_int}  v_bo={v_bo:.0f}km/s  "
+            f"salvo={salvo:<4}  int/sat={n_int}  v_bo={v_bo:.0f}km/s  "
             f"detect={detect_s:.0f}s  decide={decide_s:.0f}s  burnout={burnout_s:.0f}s  a_g={a_g_val:.1f}"
         )
+
+        # Optional: skip combos that already have a result in S3
+        if skip_existing and _results_exist(s3, S3_BUCKET, cfg):
+            print(f"  SKIP {label}  (already in S3)")
+            skipped.append({"job_name": job_name, "reason": "results already in S3"})
+            continue
 
         if dry_run:
             print(f"  DRY  {label}")
             print(f"         config  → s3://{S3_BUCKET}/{config_key}")
             print(f"         job     → {job_name}")
-            continue
-
-        # Check if results already exist in S3 — skip if so
-        if _results_exist(
-            s3, S3_BUCKET,
-            target_mode=TARGET_MODE, country=country, target_points=target_points,
-            altitude_km=alt_km, salvo=salvo, n_int=n_int, v_bo=v_bo,
-            detection_time_s=detect_s, decision_time_s=decide_s,
-            target_missile_burnout_time_s=burnout_s, a_g=a_g_val,
-        ):
-            print(f"  SKIP {label}  (results already in S3)")
-            skipped.append({"job_name": job_name, "reason": "results already in S3"})
             continue
 
         try:
@@ -440,22 +404,12 @@ def main(dry_run: bool = False, stagger_seconds: int = 0, stagger_count: int = 1
     else:
         print(f"Sweep launch complete.")
         print(f"  Submitted : {len(submitted)}")
-        print(f"  Skipped   : {len(skipped)}  (results already in S3)")
+        print(f"  Skipped   : {len(skipped)}  (--skip-existing)")
         print(f"  Failed    : {len(failed)}")
         if failed:
             print("\nFailed submissions:")
             for f in failed:
                 print(f"  {f['job_name']}  —  {f['error']}")
-        # Always write manifest so skips are logged even if nothing was submitted
-        manifest_path = f"sweep_manifest_{ts}.json"
-        with open(manifest_path, "w", encoding="utf-8") as fh:
-            json.dump({
-                "sweep_tag": sweep_tag,
-                "submitted": submitted,
-                "skipped":   skipped,
-                "failed":    failed,
-            }, fh, indent=2)
-        print(f"\n  Manifest written to: {manifest_path}")
     print("=" * 70)
 
     if failed and not dry_run:
@@ -483,5 +437,11 @@ if __name__ == "__main__":
         metavar="N",
         help="Number of initial submissions to stagger (default: 10).",
     )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip combinations whose run identity already exists in S3 runs/ (default: submit everything).",
+    )
     args = parser.parse_args()
-    main(dry_run=args.dry_run, stagger_seconds=args.stagger_seconds, stagger_count=args.stagger_count)
+    main(dry_run=args.dry_run, stagger_seconds=args.stagger_seconds, stagger_count=args.stagger_count,
+         skip_existing=args.skip_existing or SKIP_EXISTING)

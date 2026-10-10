@@ -4,7 +4,8 @@ batch_worker.py
 Cloud-native SCLP optimization script for AWS Batch.
 
 Mirrors lee_test2.py exactly — country-mode target shell or prespecified
-target points, full inclination × RAAN seed grid, greedy seed selection — but
+target points, Lee exact-J2 seed families (anchored from the target latitudes,
+shared repeat period) × RAAN seed grid, greedy seed selection — but
 reads all problem inputs from a JSON config file stored in S3 and writes all
 outputs back to S3.  Designed to run inside a Docker container on AWS Batch.
 Submitted via cloud_run.py (single job) or cloud_sweep.py (parameter sweep).
@@ -26,9 +27,10 @@ _CONFIG_DEFAULTS below for the full set:
         "target_country":               "China",         // required in country mode
         "target_points":                null,            // [[name, lat, lon], ...], required in prespecified mode
         "target_shell_n_points":        15000,           // optional, default 15000 (country mode)
-        "target_altitude_km":           450.0,           // required
-        "altitude_max_repeat_days":     2,               // optional, default 2
-        "inclination_sweep_bounds_deg": [20.0, 90.0],   // optional, default [20, 90]
+        "nd_repeat":                    3,               // optional, default 3 (days in the shared repeat period)
+        "altitude_min_km":              200.0,           // optional; the upper altitude bound is intercept_alt + R_max
+        "anchor_lat_margin_deg":        0.0,             // optional, default 0
+        "raan_step_deg":                0.25,            // optional, default 0.25
         "v_bo_km_s":                    6.0,             // required
         "salvo_size":                   1,               // required
         "n_interceptors_per_sat":       1,               // required
@@ -36,12 +38,13 @@ _CONFIG_DEFAULTS below for the full set:
         "time_limit_s":                 3600             // required
     }
 
-Outputs uploaded to s3://<S3_BUCKET>/<S3_PREFIX>/:
-    <job_name>.csv              Orbital elements of selected satellites.
-    <job_name>.json             Full simulation config sidecar
-                                (compatible with coverage_from_sclp.py).
-    <job_name>_gurobi.log       Gurobi solver log.
-    <job_name>_config.json      Copy of the input config for traceability.
+Outputs uploaded flat to s3://<S3_BUCKET>/[<S3_PREFIX>/]runs/ (no subfolders). <run> is the
+short run name from sbi_coverage.runnames, e.g. CNP-s046-d15-v6-g10-b170-k0-i1-261009a-6dff:
+    <run>_result.csv        Orbital elements of selected satellites.
+    <run>_result.json       Full simulation config sidecar
+                            (compatible with coverage_from_sclp.py).
+    <run>_gurobi.log        Gurobi solver log.
+    <run>_config.json       Copy of the input config for traceability.
 """
 from __future__ import annotations
 
@@ -52,7 +55,6 @@ import math
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import boto3
@@ -60,16 +62,18 @@ import numpy as np
 
 from sbi_coverage.core.config import CoverageConfig, EarthConstants, SimConfig
 from sbi_coverage.core.shell import Shell
+from sbi_coverage.runnames import encode_run_name, next_seq, parse_filename, settings_from_config, settings_key
 from sbi_coverage.core.simulate import run_simulation
 from sbi_coverage.Lee import (
     build_orb_elems_table,
-    build_param_V,
-    candidate_rgt_ratios,
-    param_V_summary,
+    build_seed_pool,
+    family_satellite_counts,
+    filter_seed_pool,
+    plan_seed_families,
     print_orb_table,
-    rgt_common_ground_track_layer,
     save_sclp_result,
-    seed_layer,
+    seed_run_config,
+    simulate_seed_pool,
     solve_sclp,
 )
 
@@ -89,30 +93,29 @@ _CONFIG_DEFAULTS: dict = {
     # Run metadata -- saved into run_config only, no other effect
     "run_name":                     None,
     "is_principal_set":             False,
+    "is_test_run":                  False,   # prefixes the run name with TEST-
+    "scenario":                     None,    # short scenario code for the run name (e.g. "NK"); inferred for countries
     # Target — exactly one of target_country or target_points must be set
     "target_mode":                  "country",   # "country" or "prespecified"
     "target_country":               None,
     "target_points":                None,        # list of [name, lat, lon] for prespecified mode
     "target_shell_n_points":        15000,
-    "target_altitude_km":           None,    # required
-    "inclination_sweep_bounds_deg": [20.0, 90.0],
+    # Seed families (Lee exact J2): altitude/inclination are derived from the
+    # target latitudes, not given.  Upper altitude bound = intercept_alt + R_max.
+    "nd_repeat":                    3,
+    "altitude_min_km":              200.0,
+    "anchor_lat_margin_deg":        0.0,
+    "raan_step_deg":                0.25,
     "v_bo_km_s":                    None,    # required
     "salvo_size":                   None,    # required
     "n_interceptors_per_sat":       None,    # required
     "mip_gap":                      0.01,
     "time_limit_s":                 None,    # required
-    "altitude_max_repeat_days":     2,
-    # Seed selection: rarity-weighted, margin-driven build + trim (mirrors
-    # lee_test2.py) -- replaces the old fixed n_seeds_for_milp / per-
-    # r_required lookup table, which didn't scale with target-set size and
-    # could, via its unconditional "one per every live inclination"
-    # guarantee, blow far past any reasonable margin on wide-inclination
-    # scenarios before the fill phase ever ran.
-    "margin_multiplier":            3.0,
-    "trim_margin_multiplier":       1.25,
+    # Seed selection: worst-case-first, margin-driven build + trim (shared with
+    # lee_test2.py via sbi_coverage.Lee.seed_pipeline).
+    "margin_multiplier":            5.0,
+    "trim_margin_multiplier":       2.0,
     "max_seeds_safety_cap":         200,
-    "polar_band_deg":               [70.0, 90.0],
-    "polar_band_divisor":           5.0,
     # Simulation parameters
     "dt_s":                         120.0,
     # Old "t_window_s" (time from target launch to intercept, assumed ==
@@ -125,8 +128,6 @@ _CONFIG_DEFAULTS: dict = {
     "a_g":                          10.0,
     "intercept_alt_km":             200.0,
     "min_elev_deg":                 0.0,
-    "inc_screen_step_deg":          1.0,
-    "n_raan_offsets":               10,
     "seed_workers":                 8,
     # Solver tuning -- intentionally neutral (Gurobi's own defaults) unless a
     # config explicitly overrides one of these; the schema still accepts
@@ -142,7 +143,6 @@ _CONFIG_DEFAULTS: dict = {
 }
 
 _REQUIRED_CONFIG_KEYS = {
-    "target_altitude_km",
     "v_bo_km_s",
     "salvo_size",
     "n_interceptors_per_sat",
@@ -154,68 +154,20 @@ _REQUIRED_CONFIG_KEYS = {
 # Environment variable helpers
 # ---------------------------------------------------------------------------
 
-def _build_s3_prefix(cfg: dict, actual_alt_km: float, n_targets: int) -> str:
-    """Build a hierarchical S3 prefix from run parameters.
-
-    Structure:
-        <target-mode>/<target-name>/target-points-<N>/
-        intercept-alt-<X>km/orbit-alt-<X>km/burnout-vel-<X>km-s/
-        intercept-window-<X>s/detection-time-<X>s/decision-time-<X>s/
-        max-accel-<X>g/interceptors-per-sat-<X>/doctrine-<X>x/salvo-size-<X>
-    """
-    # --- target mode and name ---
-    mode = str(cfg.get("target_mode", "country")).strip().lower()
-
-    if mode == "prespecified":
-        pts = cfg.get("target_points") or []
-        if pts:
-            first_name = str(pts[0][0]).strip().lower().replace(" ", "-").replace(":", "").replace("/", "-")
-            target_name = first_name[:40]
-        else:
-            target_name = "prespecified"
-    else:
-        mode = "country"
-        country_raw = cfg["target_country"]
-        if isinstance(country_raw, str):
-            countries = [country_raw.strip()]
-        else:
-            countries = [str(c).strip() for c in country_raw]
-        target_name = "+".join(
-            sorted(c.lower().replace(" ", "-") for c in countries if c)
-        )
-
-    # --- numeric parameters ---
-    intercept_alt = round(float(cfg["intercept_alt_km"]))
-    orbit_alt     = round(float(actual_alt_km))
-    vbo           = cfg["v_bo_km_s"]
-    # "t_window" name and the "intercept-window" label below are kept (not
-    # renamed to burnout_time/burnout-time) so existing path-parsing regexes
-    # (cloud_plot_best_results.py, plot_best_results_by_country.py) keep
-    # matching -- only the source of the number changed, from t_window_s to
-    # target_missile_burnout_time_s (numerically identical at defaults).
-    t_window      = round(float(cfg["target_missile_burnout_time_s"]))
-    detect_time   = round(float(cfg["detection_time_s"]))
-    decide_time   = round(float(cfg["decision_time_s"]))
-    a_g           = float(cfg["a_g"])
-    ips           = int(cfg["n_interceptors_per_sat"])
-    doctrine      = 1   # multiplier on r_required; always 1 for now
-    salvo         = int(cfg["salvo_size"])
-
-    return "/".join([
-        mode,
-        target_name,
-        f"target-points-{n_targets}",
-        f"intercept-alt-{intercept_alt}km",
-        f"orbit-alt-{orbit_alt}km",
-        f"burnout-vel-{vbo:.1f}km-s",
-        f"intercept-window-{t_window}s",
-        f"detection-time-{detect_time}s",
-        f"decision-time-{decide_time}s",
-        f"max-accel-{a_g:.1f}g",
-        f"interceptors-per-sat-{ips}",
-        f"doctrine-{doctrine}x",
-        f"salvo-size-{salvo}",
-    ])
+def _resolve_run_id(settings: dict, bucket: str, flat_prefix: str) -> str:
+    """Run name = readable settings + today's date + first unused same-day sequence letter."""
+    date = datetime.datetime.now(datetime.timezone.utc).date()
+    existing: list[str] = []
+    try:
+        s3 = boto3.client("s3")
+        stem = encode_run_name(settings, date, "a")
+        head = stem[: stem.index(date.strftime("%y%m%d"))]
+        for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=f"{flat_prefix}/{head}"):
+            existing += [o["Key"].rsplit("/", 1)[-1] for o in page.get("Contents", [])]
+    except Exception as exc:  # listing is best-effort; the worker must not fail on it
+        print(f"[batch_worker] WARNING: could not list existing runs ({exc}); using seq 'a'", flush=True)
+    names = [parse_filename(k)[0] for k in existing if parse_filename(k)]
+    return encode_run_name(settings, date, next_seq(names, settings, date))
 
 
 def _require_env(name: str) -> str:
@@ -329,16 +281,13 @@ def _load_config(s3_uri: str) -> dict:
     cfg["target_country"]               = (
         str(cfg["target_country"]).strip() if cfg.get("target_country") is not None else None
     )
-    cfg["target_altitude_km"]           = float(cfg["target_altitude_km"])
-    cfg["inclination_sweep_bounds_deg"] = [
-        float(x) for x in cfg["inclination_sweep_bounds_deg"]
-    ]
-    cfg["altitude_max_repeat_days"]     = int(cfg["altitude_max_repeat_days"])
+    cfg["nd_repeat"]                    = int(cfg["nd_repeat"])
+    cfg["altitude_min_km"]              = float(cfg["altitude_min_km"])
+    cfg["anchor_lat_margin_deg"]        = float(cfg["anchor_lat_margin_deg"])
+    cfg["raan_step_deg"]                = float(cfg["raan_step_deg"])
     cfg["margin_multiplier"]            = float(cfg["margin_multiplier"])
     cfg["trim_margin_multiplier"]       = float(cfg["trim_margin_multiplier"])
     cfg["max_seeds_safety_cap"]         = int(cfg["max_seeds_safety_cap"])
-    cfg["polar_band_deg"]               = [float(x) for x in cfg["polar_band_deg"]]
-    cfg["polar_band_divisor"]           = float(cfg["polar_band_divisor"])
     cfg["dt_s"]                         = float(cfg["dt_s"])
     cfg["detection_time_s"]             = float(cfg["detection_time_s"])
     cfg["decision_time_s"]              = float(cfg["decision_time_s"])
@@ -346,8 +295,6 @@ def _load_config(s3_uri: str) -> dict:
     cfg["a_g"]                          = float(cfg["a_g"])
     cfg["intercept_alt_km"]             = float(cfg["intercept_alt_km"])
     cfg["min_elev_deg"]                 = float(cfg["min_elev_deg"])
-    cfg["inc_screen_step_deg"]          = float(cfg["inc_screen_step_deg"])
-    cfg["n_raan_offsets"]               = int(cfg["n_raan_offsets"])
     cfg["seed_workers"]                 = int(cfg["seed_workers"])
     cfg["mip_focus"]                    = int(cfg["mip_focus"])
     cfg["heuristics_frac"]              = float(cfg["heuristics_frac"])
@@ -356,172 +303,12 @@ def _load_config(s3_uri: str) -> dict:
     )
     cfg["run_name"]                     = str(cfg["run_name"]) if cfg.get("run_name") is not None else None
     cfg["is_principal_set"]             = bool(cfg.get("is_principal_set", False))
+    cfg["is_test_run"]                  = bool(cfg.get("is_test_run", False))
     cfg["stop_at_gap"]                  = (
         float(cfg["stop_at_gap"]) if cfg.get("stop_at_gap") is not None else None
     )
 
     return cfg
-
-
-# ---------------------------------------------------------------------------
-# Seed selection: rarity-weighted, margin-driven build + trim (mirrors
-# lee_test2.py -- see that file for the full design rationale).
-# ---------------------------------------------------------------------------
-
-def _rarity_weights(access: np.ndarray) -> np.ndarray:
-    """Static, pool-level scarcity weight per target, computed once from the
-    full candidate pool before any selection happens.
-
-    Rank-based rather than a raw 1/total_access inverse: a target reachable
-    by only one or two candidates in the whole pool would otherwise get a
-    weight that dwarfs everything else and causes the greedy to fixate on it
-    exclusively. Scarcest target -> 1.0, most common -> a 0.1 floor (kept
-    nonzero so ties among candidates that only help common targets don't
-    degenerate to all-zero scores).
-    """
-    total_access = access.sum(axis=0)
-    n_targets = len(total_access)
-    if n_targets <= 1:
-        return np.ones(n_targets)
-    order = np.argsort(total_access)          # ascending: scarcest target first
-    rank = np.empty(n_targets, dtype=np.float64)
-    rank[order] = np.arange(n_targets, dtype=np.float64)
-    return 0.1 + 0.9 * (1.0 - rank / (n_targets - 1))
-
-
-def _greedy_select_seeds(
-    v0_list: list[np.ndarray],
-    r_required: int,
-    max_seeds: int,
-    *,
-    margin_multiplier: float,
-    polar_band_deg: tuple[float, float],
-    polar_band_divisor: float,
-    inc_deg_list: list[float] | None = None,
-) -> tuple[list[int], set[int], np.ndarray, np.ndarray]:
-    """Rarity-weighted, margin-driven greedy seed selection.
-
-    Phase 1 -- Polar-band reservation (capped, not unconditional): reserves
-    up to ceil(r_required / polar_band_divisor) seeds, eligible inclinations
-    restricted to polar_band_deg, chosen by the rarity-weighted, margin-capped
-    score. Not "one per every live inclination" -- on a scenario with many
-    live inclinations, guaranteeing all of them can by itself blow past the
-    margin target before Phase 2 ever runs.
-
-    Phase 2 -- Greedy fill: keeps adding seeds (rarity-weighted, margin-capped
-    score, unbounded in inclination) until EITHER the worst-covered target's
-    accumulated access reaches margin_multiplier * r_required, OR max_seeds
-    is hit (a safety ceiling, not a target), OR no live candidates remain.
-
-    Returns (selected indices in selection order, the set of indices picked
-    during Phase 1 for reporting/tagging purposes only -- NOT protected from
-    trimming, see _trim_seeds -- the final per-target coverage array, and the
-    access matrix).
-    """
-    n_seeds       = len(v0_list)
-    access        = np.stack([v0.sum(axis=0) for v0 in v0_list]).astype(np.float64)
-    rarity        = _rarity_weights(access)
-    n_targets     = access.shape[1]
-    margin_target = margin_multiplier * r_required
-    coverage      = np.zeros(n_targets, dtype=np.float64)
-    selected: list[int] = []
-    polar_reserved: set[int] = set()
-    remaining = list(range(n_seeds))
-
-    def _scores(cands_idx: list[int]) -> np.ndarray:
-        deficit = np.maximum(0.0, margin_target - coverage)
-        return (np.minimum(access[cands_idx], deficit) * rarity).sum(axis=1)
-
-    # ------------------------------------------------------------------
-    # Phase 1: Polar-band reservation
-    # ------------------------------------------------------------------
-    if inc_deg_list is not None:
-        polar_lo, polar_hi = polar_band_deg
-        polar_budget = int(np.ceil(r_required / polar_band_divisor))
-        pending_incs = sorted(
-            inc for inc in set(inc_deg_list)
-            if polar_lo <= inc <= polar_hi
-        )
-
-        while (
-            pending_incs
-            and len(selected) < max_seeds
-            and len(polar_reserved) < polar_budget
-        ):
-            best_score   = -np.inf
-            best_global  = -1
-            best_inc_idx = -1
-
-            for ii, inc in enumerate(pending_incs):
-                cands = [i for i in remaining if abs(inc_deg_list[i] - inc) < 0.1]
-                if not cands:
-                    continue
-                scores     = _scores(cands)
-                local_best = int(np.argmax(scores))
-                score      = float(scores[local_best])
-                if score > best_score:
-                    best_score   = score
-                    best_global  = cands[local_best]
-                    best_inc_idx = ii
-
-            if best_global == -1:
-                break
-
-            selected.append(best_global)
-            polar_reserved.add(best_global)
-            coverage = coverage + access[best_global]
-            remaining.remove(best_global)
-            pending_incs.pop(best_inc_idx)
-
-    # ------------------------------------------------------------------
-    # Phase 2: Greedy fill — stop once every target clears the margin target
-    # ------------------------------------------------------------------
-    while remaining and len(selected) < max_seeds:
-        if float(coverage.min()) >= margin_target:
-            break
-        scores      = _scores(remaining)
-        best_local  = int(np.argmax(scores))
-        best_global = remaining[best_local]
-        selected.append(best_global)
-        coverage = coverage + access[best_global]
-        remaining.pop(best_local)
-
-    return selected, polar_reserved, coverage, access
-
-
-def _trim_seeds(
-    selected: list[int],
-    access: np.ndarray,
-    coverage: np.ndarray,
-    r_required: int,
-    trim_margin_multiplier: float,
-) -> list[int]:
-    """Reverse marginal-contribution trim -- single pass, no seed is exempt.
-
-    Repeatedly removes whichever currently-selected seed does the LEAST
-    damage to the worst-covered target, stopping once no further removal
-    would leave every target at or above trim_margin_multiplier * r_required.
-    No seed is exempt regardless of which phase selected it -- Phase 1
-    reserves only a small, requirement-scaled number of seeds, so the risk of
-    trim removing a large structural investment is bounded and acceptable.
-    """
-    floor    = trim_margin_multiplier * r_required
-    current  = list(selected)
-    coverage = coverage.copy()
-
-    while True:
-        remaining_margins = {
-            i: float((coverage - access[i]).min()) for i in current
-        }
-        if not remaining_margins:
-            break
-        best_i = max(remaining_margins, key=remaining_margins.get)
-        if remaining_margins[best_i] < floor:
-            break
-        current.remove(best_i)
-        coverage = coverage - access[best_i]
-
-    return current
 
 
 # ---------------------------------------------------------------------------
@@ -539,12 +326,13 @@ def main() -> None:
     cfg    = _load_config(s3_config_uri)
     job    = cfg["job_name"]
     bucket = s3_bucket
-    # prefix is resolved after actual_alt_km is known (see below)
+    run_settings = settings_from_config(cfg)
+    flat_prefix  = f"{s3_base}/runs" if s3_base else "runs"
+    run_id       = _resolve_run_id(run_settings, bucket, flat_prefix)
 
     target_mode     = cfg["target_mode"]
     country         = cfg.get("target_country")
     target_points   = cfg.get("target_points")   # list of [name, lat, lon] or None
-    inc_lo, inc_hi  = cfg["inclination_sweep_bounds_deg"]
 
     # ------------------------------------------------------------------
     # Startup banner — fully visible in CloudWatch Logs
@@ -558,17 +346,17 @@ def main() -> None:
     print("batch_worker.py  —  SBI SCLP Cloud Runner",                          flush=True)
     print("=" * 60,                                                              flush=True)
     print(f"  Job name       : {job}",                                           flush=True)
+    print(f"  Run name       : {run_id}",                                        flush=True)
     print(f"  Config source  : {s3_config_uri}",                                 flush=True)
     print(f"  Target         : {_target_desc}",                                  flush=True)
-    print(f"  Inc bounds     : [{inc_lo:.1f}°, {inc_hi:.1f}°]",                 flush=True)
-    print(f"  Altitude       : {cfg['target_altitude_km']} km",                   flush=True)
+    print(f"  Seed families  : N_D={cfg['nd_repeat']}, altitude from {cfg['altitude_min_km']:.0f} km to intercept alt + R_max",  flush=True)
     print(f"  v_bo           : {cfg['v_bo_km_s']} km/s",                        flush=True)
     print(f"  Salvo size     : {cfg['salvo_size']}",                             flush=True)
     print(f"  Interceptors   : {cfg['n_interceptors_per_sat']} per sat",         flush=True)
     print(f"  MIP gap        : {cfg['mip_gap'] * 100:.2f}%",                     flush=True)
     print(f"  Time limit     : {cfg['time_limit_s']:.0f} s"
           f"  ({cfg['time_limit_s'] / 3600:.2f} h)",                             flush=True)
-    print(f"  S3 bucket      : {bucket}  (prefix resolved after shell masking)",  flush=True)
+    print(f"  S3 bucket      : {bucket}  (all outputs flat under runs/)",  flush=True)
     print("=" * 60,                                                              flush=True)
 
     # ------------------------------------------------------------------
@@ -593,56 +381,6 @@ def main() -> None:
         flush=True,
     )
     print(f"\nComputed R_max: {cov.max_range_km:.2f} km", flush=True)
-
-    # ------------------------------------------------------------------
-    # RGT orbit selection
-    # ------------------------------------------------------------------
-    candidates = candidate_rgt_ratios(
-        h_star_km=cfg["target_altitude_km"],
-        earth=earth,
-        max_repeat_days=cfg["altitude_max_repeat_days"],
-        dt_s=cfg["dt_s"],
-    )
-    if not candidates:
-        print(
-            f"[batch_worker] ERROR: No RGT orbit found near {cfg['target_altitude_km']:.0f} km "
-            f"with N_D ≤ {cfg['altitude_max_repeat_days']}.",
-            flush=True,
-        )
-        sys.exit(1)
-
-    best          = candidates[0]
-    N_P           = int(best["N_P"])
-    N_D           = int(best["N_D"])
-    L             = int(best["L"])
-    actual_alt_km = float(best["alt_km"])
-
-    _dt_s_actual = float(best["T_r_s"]) / L
-    horizon_s    = (L - 1) * _dt_s_actual
-
-    print(
-        f"\nTarget altitude requested: {cfg['target_altitude_km']:.1f} km  →  "
-        f"nearest RGT orbit: {N_P}:{N_D}  "
-        f"actual_alt={actual_alt_km:.2f} km  "
-        f"(snap error: {float(best['alt_error_km']):.2f} km)",
-        flush=True,
-    )
-
-    sim = SimConfig(
-        horizon_s=horizon_s,
-        dt_s=_dt_s_actual,
-        analysis_matrix_dtype="uint8",
-        use_j2=False,
-        use_drag=False,
-    )
-    print(
-        f"Shared repeat family: N_D={N_D}  L={L} steps",
-        flush=True,
-    )
-    print(
-        f"Simulation horizon: {horizon_s:.1f} s  ({horizon_s / 3600:.3f} h)  -> L={L}",
-        flush=True,
-    )
 
     # ------------------------------------------------------------------
     # Target shell — country or prespecified
@@ -680,182 +418,90 @@ def main() -> None:
         labels    = [f"{country} target {i}" for i in range(n_targets)]
         shell.meta["labels"] = labels
 
-    _auto_prefix = _build_s3_prefix(cfg, actual_alt_km, n_targets)
-    prefix = f"{s3_base}/{_auto_prefix}" if s3_base else _auto_prefix
+    # ------------------------------------------------------------------
+    # Seed families: anchored top-down from the target latitudes, synchronized
+    # repeat period (Lee Eq. 33), exact secular J2.  Altitude is an OUTPUT.
+    # ------------------------------------------------------------------
+    try:
+        plan = plan_seed_families(
+            [[labels[i], float(lats_deg[i]), float(lons_deg[i])] for i in range(n_targets)],
+            earth=earth,
+            N_D=cfg["nd_repeat"],
+            alt_min_km=cfg["altitude_min_km"],
+            anchor_lat_margin_deg=cfg["anchor_lat_margin_deg"],
+            cov=cov,
+            dt_target_s=cfg["dt_s"],
+        )
+    except ValueError as exc:
+        print(f"[batch_worker] ERROR: seed family planning failed: {exc}", flush=True)
+        sys.exit(1)
+    families      = plan["families"]
+    N_D           = int(plan["N_D"])
+    L             = int(plan["L"])
+    _dt_s_actual  = float(plan["dt_s"])
+    horizon_s     = (L - 1) * _dt_s_actual
+    anchor        = plan["anchor"]
+    actual_alt_km = float(anchor["alt_km"])   # anchor altitude: labels the S3 prefix
+    gen = plan["generation"]
+    print(
+        f"\nSeed families (N_D={N_D}, altitude {plan['alt_bounds_km'][0]:.0f}-{plan['alt_bounds_km'][1]:.0f} km "
+        f"= shell + R_max, target latitudes {plan['lat_min_deg']:.2f}-{plan['lat_max_deg']:.2f} deg, "
+        f"span {gen['target_lat_span_deg']:.2f}):",
+        flush=True,
+    )
+    for f in families:
+        red = f" [reducible -> {f['reduced_ratio']}]" if f["reducible"] else ""
+        print(f"  {'anchor' if f['is_anchor'] else '      '} {f['N_P']:3d}:{f['N_D']}  i={f['inc_deg']:7.3f} deg  "
+              f"alt={f['alt_km']:7.2f} km  reach={f['reach_deg']:.2f} deg  floor={f['inc_floor_deg']:.2f} deg{red}", flush=True)
+    print(f"  unique altitude/inclination combos: generated {gen['n_unique_alt_inc_combos_all_candidates']} "
+          f"(chosen ladder {gen['n_unique_alt_inc_combos_chosen_ladder']}), kept {gen['n_unique_alt_inc_combos_kept']}", flush=True)
+    print(f"Shared repeat period T_r={plan['T_r_s']:.3f} s  L={L} steps  dt={_dt_s_actual:.6f} s  "
+          f"horizon={horizon_s:.1f} s ({horizon_s / 3600:.3f} h)", flush=True)
+
+    sim = SimConfig(
+        horizon_s=horizon_s,
+        dt_s=_dt_s_actual,
+        analysis_matrix_dtype="uint8",
+        use_j2=True,
+        use_drag=False,
+    )
+
+    prefix = flat_prefix
 
     print(f"\nTarget mode: {target_mode}  n_targets={n_targets}", flush=True)
     print(f"[batch_worker] S3 prefix: {prefix}", flush=True)
 
     # ------------------------------------------------------------------
-    # Inclination × RAAN seed grid
+    # Seed pool (family x RAAN), simulation, filter (see Lee/seed_pipeline.py)
     # ------------------------------------------------------------------
-    inc_grid = np.arange(
-        float(inc_lo),
-        float(inc_hi) + float(cfg["inc_screen_step_deg"]) * 0.5,
-        float(cfg["inc_screen_step_deg"]),
-    )
-    raan_interval = 360.0 / N_P
-    raan_grid     = np.linspace(0.0, raan_interval, cfg["n_raan_offsets"], endpoint=False)
-    seed_pairs    = [(float(inc), float(raan)) for inc in inc_grid for raan in raan_grid]
-    n_seeds_total = len(seed_pairs)
+    def _log(msg: str) -> None:
+        print(msg, flush=True)
 
-    print(
-        f"\nSeed grid: {len(inc_grid)} inclinations × {cfg['n_raan_offsets']} RAANs"
-        f" = {n_seeds_total} seeds",
-        flush=True,
-    )
-    print(
-        f"  inclinations : {float(inc_lo):.1f}°–{float(inc_hi):.1f}°"
-        f"  step {cfg['inc_screen_step_deg']:.1f}°",
-        flush=True,
-    )
-    print(
-        f"  RAANs        : {cfg['n_raan_offsets']} offsets in [0°, {raan_interval:.3f}°)"
-        f"  (360° / N_P={N_P})  step={raan_interval / cfg['n_raan_offsets']:.3f}°",
-        flush=True,
-    )
-
-    # ------------------------------------------------------------------
-    # Build sub-layers
-    # ------------------------------------------------------------------
-    sub_layers = [
-        rgt_common_ground_track_layer(
-            inc_deg=inc,
-            N_P=N_P,
-            N_D=N_D,
-            L=L,
-            earth=earth,
-            raan0_deg=raan,
-            use_j2=False,
-        )
-        for inc, raan in seed_pairs
-    ]
-
-    # ------------------------------------------------------------------
-    # Simulate all seeds in parallel
-    # ------------------------------------------------------------------
-    def _simulate_seed(idx: int) -> tuple[int, np.ndarray]:
-        s_layer  = seed_layer(sub_layers[idx])
-        analysis = run_simulation(
-            elems0=s_layer.elems,
-            phys=s_layer.phys,
-            sim=sim,
-            cov=cov,
-            earth=earth,
-            shell=shell,
-            layer_specs=s_layer.spec,
-            propagator=_PROPAGATOR,
-        )
-        return idx, (analysis.counts > 0).astype(np.float64)
-
-    n_seeds = n_seeds_total
-    print(f"\nSimulating {n_seeds} seeds  (workers={cfg['seed_workers']}) ...", flush=True)
-    t_sim0 = time.perf_counter()
-    v0_list: list[np.ndarray] = [None] * n_seeds  # type: ignore[list-item]
-    progress_every = max(1, n_seeds // 20)
-
-    with ThreadPoolExecutor(max_workers=cfg["seed_workers"]) as pool:
-        futs = {pool.submit(_simulate_seed, i): i for i in range(n_seeds)}
-        done_count = 0
-        for fut in as_completed(futs):
-            idx, v0 = fut.result()
-            v0_list[idx] = v0
-            done_count += 1
-            if done_count % progress_every == 0 or done_count == n_seeds:
-                print(f"  {done_count}/{n_seeds} seeds simulated ...", flush=True)
-
-    print(f"Total seed simulation time: {time.perf_counter() - t_sim0:.2f} s", flush=True)
-
-    # ------------------------------------------------------------------
-    # Seed selection: dead-filter → greedy rank → top N to MILP
-    # ------------------------------------------------------------------
     r_required = int(np.ceil(cfg["salvo_size"] / cfg["n_interceptors_per_sat"]))
+    seed_meta, sub_layers = build_seed_pool(plan, cfg["raan_step_deg"], earth)
+    print(f"\nSeed grid: {len(seed_meta)} seeds  (RAAN step {cfg['raan_step_deg']:.2f} deg within each family's window)", flush=True)
+    for f in families:
+        print(f"  family {f['N_P']}:{f['N_D']}: {f['n_raan_offsets']} RAAN offsets in [0, {f['raan_interval_deg']:.3f}) deg", flush=True)
 
-    live_mask = [bool(v0.any()) for v0 in v0_list]
-    n_dead    = live_mask.count(False)
-    if n_dead:
-        print(f"\nPre-filter: removed {n_dead}/{n_seeds} seeds with zero target access.", flush=True)
-        v0_list    = [v for v, keep in zip(v0_list,    live_mask) if keep]
-        sub_layers = [s for s, keep in zip(sub_layers, live_mask) if keep]
-        seed_pairs = [p for p, keep in zip(seed_pairs, live_mask) if keep]
-        n_seeds    = len(v0_list)
-    n_seeds_live = n_seeds
-
-    inc_deg_list  = [float(p[0]) for p in seed_pairs]
-    margin_target = cfg["margin_multiplier"] * r_required
-    build_idx, polar_reserved_set, build_coverage, access_full = _greedy_select_seeds(
-        v0_list, r_required, cfg["max_seeds_safety_cap"],
-        margin_multiplier=cfg["margin_multiplier"],
-        polar_band_deg=tuple(cfg["polar_band_deg"]),
-        polar_band_divisor=cfg["polar_band_divisor"],
-        inc_deg_list=inc_deg_list,
+    v0_list = simulate_seed_pool(
+        sub_layers, sim=sim, cov=cov, earth=earth, shell=shell,
+        propagator=_PROPAGATOR, workers=cfg["seed_workers"], log=_log,
     )
-    build_worst_margin = float(build_coverage.min())
-    n_built = len(build_idx)
-    print(
-        f"\nBuild phase: {n_built} of {n_seeds} live seeds selected  "
-        f"(target: worst-slot margin >= {cfg['margin_multiplier']:.2f}x requirement = {margin_target:.1f})",
-        flush=True,
-    )
-    print(
-        f"  Worst-slot margin achieved: {build_worst_margin:.1f}  "
-        f"({build_worst_margin / r_required:.2f}x requirement)"
-        + ("  [safety cap max_seeds_safety_cap reached before target margin]"
-           if n_built >= cfg["max_seeds_safety_cap"] and build_worst_margin < margin_target - 1e-9
-           else ""),
-        flush=True,
-    )
-
-    trim_floor = cfg["trim_margin_multiplier"] * r_required
-    greedy_idx = _trim_seeds(
-        build_idx, access_full, build_coverage, r_required,
-        cfg["trim_margin_multiplier"],
-    )
-    n_selected    = len(greedy_idx)
-    trim_coverage = access_full[greedy_idx].sum(axis=0)
-    trim_worst_margin = float(trim_coverage.min())
-    n_trimmed = n_built - n_selected
-    print(
-        f"Trim phase : removed {n_trimmed} seed(s), {n_built} → {n_selected}  "
-        f"(floor: worst-slot margin >= {cfg['trim_margin_multiplier']:.2f}x requirement = {trim_floor:.1f})",
-        flush=True,
-    )
-    print(
-        f"  Worst-slot margin after trim: {trim_worst_margin:.1f}  "
-        f"({trim_worst_margin / r_required:.2f}x requirement)",
-        flush=True,
-    )
-
-    feasible_proxy = trim_worst_margin >= r_required
-    print(
-        f"  Coverage proxy (all slots of selected seeds): "
-        f"min={trim_worst_margin:.1f}  mean={float(trim_coverage.mean()):.1f}  "
-        f"requirement={r_required}  "
-        + ("✓ feasible" if feasible_proxy
-           else "⚠ infeasible even after build+trim — try raising margin_multiplier or max_seeds_safety_cap"),
-        flush=True,
-    )
-
-    # Tag seeds by selection phase: polar-band reservation (Phase 1) vs.
-    # quantity-driven greedy fill (Phase 2). Not a protection from trimming.
-    for rank, idx in enumerate(greedy_idx):
-        inc, raan = seed_pairs[idx]
-        tag = "  [phase 1: polar-band reservation]" if idx in polar_reserved_set else ""
-        print(
-            f"  {rank + 1:2d}: i={inc:5.1f}°  RAAN={raan:6.1f}°  "
-            f"access/target={v0_list[idx].sum(axis=0).mean():.1f}{tag}",
-            flush=True,
+    try:
+        pool = filter_seed_pool(
+            v0_list, sub_layers, seed_meta, plan, r_required,
+            margin_multiplier=cfg["margin_multiplier"],
+            trim_margin_multiplier=cfg["trim_margin_multiplier"],
+            max_seeds=cfg["max_seeds_safety_cap"],
+            log=_log,
         )
-
-    # Reindex to MILP subset (seed_pairs NOT reindexed — greedy_idx still valid)
-    v0_list_milp    = [v0_list[i]    for i in greedy_idx]
-    sub_layers_milp = [sub_layers[i] for i in greedy_idx]
-
-    # ------------------------------------------------------------------
-    # Build constraint matrix
-    # ------------------------------------------------------------------
-    param_V = build_param_V(v0_list_milp)
-    param_V_summary(param_V, n_seeds=n_selected)
+    except ValueError as exc:
+        print(f"[batch_worker] ERROR: seed filtering failed: {exc}", flush=True)
+        sys.exit(1)
+    param_V    = pool["param_V"]
+    sub_layers = pool["sub_layers"]
+    seed_meta  = pool["seed_meta"]
+    ncols      = pool["ncols"]
 
     param_r = r_required * np.ones((L, n_targets), dtype=np.float64)
     print(
@@ -868,7 +514,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Solve SCLP
     # ------------------------------------------------------------------
-    log_local = Path(f"/tmp/{job}_gurobi.log")
+    log_local = Path(f"/tmp/{run_id}_gurobi.log")
 
     print("\n" + "=" * 60, flush=True)
     print("Solving SCLP",           flush=True)
@@ -909,16 +555,29 @@ def main() -> None:
     )
     print("=" * 60, flush=True)
 
-    orb_elems = build_orb_elems_table(sub_layers_milp, L)
+    orb_elems = build_orb_elems_table(sub_layers, L, ncols)
     print_orb_table(orb_elems, result.selected_slots)
 
     # ------------------------------------------------------------------
     # Build run_config metadata block (mirrors lee_test2.py)
     # ------------------------------------------------------------------
+    per_family_counts = family_satellite_counts(result.selected_slots, ncols, seed_meta, families)
+    print("Satellites per family: " + ", ".join(f"{k}: {v}" for k, v in per_family_counts.items()), flush=True)
+    seed_cfg = seed_run_config(
+        plan, pool, per_family_counts,
+        raan_step_deg=cfg["raan_step_deg"],
+        margin_multiplier=cfg["margin_multiplier"],
+        trim_margin_multiplier=cfg["trim_margin_multiplier"],
+        max_seeds=cfg["max_seeds_safety_cap"],
+    )
+
     run_config = {
         # --- Run metadata ---
         "run_name":                       cfg["run_name"],
+        "run_id":                         run_id,
+        "run_settings_key":               settings_key(run_settings),
         "is_principal_set":               cfg["is_principal_set"],
+        "is_test_run":                    cfg["is_test_run"],
         # --- Target ---
         "target_mode":                    target_mode,
         "target_country":                 country if target_mode == "country" else None,
@@ -936,40 +595,8 @@ def main() -> None:
         "intercept_alt_km":               cfg["intercept_alt_km"],
         "min_elev_deg":                   cfg["min_elev_deg"],
         "r_max_km":                       float(cov.max_range_km),
-        # --- Orbit ---
-        "target_altitude_km":             cfg["target_altitude_km"],
-        "altitude_max_repeat_days":       cfg["altitude_max_repeat_days"],
-        "actual_alt_km":                  float(actual_alt_km),
-        "rgt_ratio":                      f"{N_P}:{N_D}",
-        "L":                              int(L),
-        "horizon_s":                      float(horizon_s),
-        # --- Seed grid ---
-        "inclination_sweep_bounds_deg":   [float(inc_lo), float(inc_hi)],
-        "inclination_screen_step_deg":    cfg["inc_screen_step_deg"],
-        "n_raan_offsets":                 cfg["n_raan_offsets"],
-        "raan_interval_deg":              float(raan_interval),
-        "raan_step_deg":                  float(raan_interval / cfg["n_raan_offsets"]),
-        "n_seeds_simulated":              int(n_seeds_total),
-        "n_seeds_live":                   int(n_seeds_live),
-        "margin_multiplier":              cfg["margin_multiplier"],
-        "trim_margin_multiplier":         cfg["trim_margin_multiplier"],
-        "max_seeds_safety_cap":           cfg["max_seeds_safety_cap"],
-        "polar_band_deg":                 list(cfg["polar_band_deg"]),
-        "polar_band_divisor":             cfg["polar_band_divisor"],
-        "n_seeds_built":                  int(n_built),
-        "n_seeds_trimmed":                int(n_trimmed),
-        "n_seeds_after_trim":             int(n_selected),
-        "build_worst_margin":             build_worst_margin,
-        "trim_worst_margin":              trim_worst_margin,
-        "bilp_n_vars":                    int(n_selected * L),
-        "seeds_selected": [
-            {
-                "rank":     rank + 1,
-                "inc_deg":  float(seed_pairs[i][0]),
-                "raan_deg": float(seed_pairs[i][1]),
-            }
-            for rank, i in enumerate(greedy_idx)
-        ],
+        # --- Orbit model, seed generation, seed filter (shared block) ---
+        **seed_cfg,
         # --- Intercept salvo ---
         "salvo_size":                     cfg["salvo_size"],
         "n_interceptors_per_sat":         cfg["n_interceptors_per_sat"],
@@ -995,14 +622,14 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Save results to /tmp then upload everything to S3
     # ------------------------------------------------------------------
-    csv_local  = Path(f"/tmp/{job}.csv")
+    csv_local  = Path(f"/tmp/{run_id}_result.csv")
     json_local = csv_local.with_suffix(".json")
 
     targets_payload = [
         {"name": labels[i], "lat_deg": float(lats_deg[i]), "lon_deg": float(lons_deg[i])}
         for i in range(n_targets)
     ]
-    bc_kg_m2 = float(np.asarray(sub_layers_milp[0].phys.bc_kg_m2).ravel()[0])
+    bc_kg_m2 = float(np.asarray(sub_layers[0].phys.bc_kg_m2).ravel()[0])
 
     _countries_arg = [country] if target_mode == "country" else []
     save_sclp_result(
@@ -1020,15 +647,15 @@ def main() -> None:
 
     print(f"\n[batch_worker] Uploading results to s3://{bucket}/{prefix}/", flush=True)
 
-    _s3_upload(csv_local,  bucket, f"{prefix}/{job}.csv")
-    _s3_upload(json_local, bucket, f"{prefix}/{job}.json")
+    _s3_upload(csv_local,  bucket, f"{prefix}/{run_id}_result.csv")
+    _s3_upload(json_local, bucket, f"{prefix}/{run_id}_result.json")
 
     if log_local.exists():
-        _s3_upload(log_local, bucket, f"{prefix}/{job}_gurobi.log")
+        _s3_upload(log_local, bucket, f"{prefix}/{run_id}_gurobi.log")
 
     # Echo the input config alongside outputs for full traceability
     config_echo = json.dumps(cfg, indent=2, default=str).encode("utf-8")
-    _s3_upload_bytes(config_echo, bucket, f"{prefix}/{job}_config.json")
+    _s3_upload_bytes(config_echo, bucket, f"{prefix}/{run_id}_config.json")
 
     print(f"\n[batch_worker] All outputs at s3://{bucket}/{prefix}/", flush=True)
     print("[batch_worker] Done.",                                       flush=True)

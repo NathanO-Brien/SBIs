@@ -4,14 +4,19 @@ check_result_coverage.py
 Re-simulate a stored SCLP result with the CURRENT code and report whether the
 selected constellation actually covers its targets.
 
-Given a results folder containing a run's output products (<name>.csv +
-<name>.json), this loads the exact orbital elements and simulation settings
+Given a run (its short name, a path to its _result.csv/_result.json, or a folder
+holding one), this loads the exact orbital elements and simulation settings
 from those files, runs the coverage simulation from scratch, and prints
 per-target coverage statistics against the run's r_required.
 
 Usage:
-    python scripts/check_result_coverage.py "results/china/tp-273/.../sal-1"
-    python scripts/check_result_coverage.py "results/.../sal-1" --verbose
+    python scripts/check_result_coverage.py CNP-s046-d15-v6-g10-b170-k0-i1-261009a-6dff
+    python scripts/check_result_coverage.py results/CNP-...-6dff_result.json --verbose
+    python scripts/check_result_coverage.py <name> --folder some/other/dir
+
+A run name that is not in --folder (default: results) is downloaded from the flat
+s3://sbi-optimization-runs/runs/ prefix into that folder first, so this also checks
+cloud results.
 """
 from __future__ import annotations
 
@@ -27,22 +32,7 @@ from sbi_coverage.core.config import EarthConstants, SimConfig, CoverageConfig, 
 from sbi_coverage.core.elements import OrbitalElements, SatellitePhysical
 from sbi_coverage.core.shell import Shell
 from sbi_coverage.core.simulate import run_simulation
-
-
-def _find_result_pair(folder: Path) -> tuple[Path, Path]:
-    """Locate the result CSV and its JSON sidecar in the folder."""
-    csvs = [p for p in folder.glob("*.csv")]
-    if not csvs:
-        raise FileNotFoundError(f"No .csv found in {folder}")
-    if len(csvs) > 1:
-        # Prefer the newest if multiple runs share the folder
-        csvs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        print(f"[note] multiple CSVs found; using newest: {csvs[0].name}")
-    csv_path = csvs[0]
-    json_path = csv_path.with_suffix(".json")
-    if not json_path.exists():
-        raise FileNotFoundError(f"JSON sidecar not found: {json_path}")
-    return csv_path, json_path
+from sbi_coverage.runindex import resolve_run_files
 
 
 def _load_orb_csv(csv_path: Path) -> np.ndarray:
@@ -63,16 +53,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Re-simulate a stored SCLP result and check its coverage."
     )
-    parser.add_argument("folder", help="Path to the run's results folder (contains .csv + .json)")
+    parser.add_argument("run", help="Run name, path to its _result.csv/.json, S3 URI/key, or a folder containing one")
+    parser.add_argument("--folder", default="results", help="Local flat results folder (default: results)")
     parser.add_argument("--verbose", action="store_true",
                         help="List every under-covered target individually.")
     args = parser.parse_args()
 
-    folder = Path(args.folder)
-    if not folder.is_dir():
-        raise NotADirectoryError(f"Not a folder: {folder}")
-
-    csv_path, json_path = _find_result_pair(folder)
+    csv_path, json_path = resolve_run_files(args.run, args.folder)
     with json_path.open() as f:
         cfg = json.load(f)
 

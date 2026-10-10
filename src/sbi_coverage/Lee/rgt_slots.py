@@ -10,6 +10,10 @@ import numpy as np
 from ..core.config import EarthConstants
 from ..core.elements import OrbitalElements, SatellitePhysical
 from ..constellations.layer import Layer
+from ..propagators.nominal_propagator import (
+    j2_secular_rates_rad_s,
+    lee_mean_anomaly_rate_rad_s,
+)
 
 
 def _a_km_from_np_nd(N_P: int, N_D: int, earth: EarthConstants) -> float:
@@ -19,19 +23,35 @@ def _a_km_from_np_nd(N_P: int, N_D: int, earth: EarthConstants) -> float:
     return float((earth.mu_km3_s2 * (T_S / (2.0 * np.pi))**2) ** (1.0 / 3.0))
 
 
+def lee_j2_rates(a_km: float, inc_deg: float, earth: EarthConstants, e: float = 0.0) -> tuple[float, float, float]:
+    """Lee (2020) Eqs. 3-5 secular rates (rad/s): (Omega_dot, omega_dot, M_dot)."""
+    i_rad = np.deg2rad(inc_deg)
+    a = np.asarray(a_km, dtype=np.float64)
+    Omegadot, omegadot = j2_secular_rates_rad_s(a, e, i_rad, earth)
+    Mdot = lee_mean_anomaly_rate_rad_s(a, e, i_rad, earth)
+    return float(Omegadot), float(omegadot), float(Mdot)
+
+
+def rgt_closure_residual(a_km: float, N_P: int, N_D: int, inc_deg: float, earth: EarthConstants) -> float:
+    """Lee Eq. 6 closure residual (rad/s): N_P (w_E - Omega_dot) - N_D (omega_dot + M_dot)."""
+    Omegadot, omegadot, Mdot = lee_j2_rates(a_km, inc_deg, earth)
+    return N_P * (earth.omega_earth_rad_s - Omegadot) - N_D * (omegadot + Mdot)
+
+
 def a_km_j2_rgt(N_P: int, N_D: int, inc_deg: float, earth: EarthConstants) -> float:
-    """J2-corrected semi-major axis for an RGT orbit (Newton-Raphson).
+    """J2-corrected semi-major axis for an RGT orbit (Newton-Raphson), Lee 2020 model.
 
-    Finds a (km) satisfying the exact J2 repeating-ground-track condition for
-    an eastward-rotating Earth (frames.py convention: ECEF_lon = RAAN − ω_E·t):
+    Finds a (km) satisfying the exact secular-J2 repeating-ground-track condition
+    for an eastward-rotating Earth (frames.py convention: ECEF_lon = RAAN - w_E*t),
+    Lee et al. (2020) Eq. 6 with the mean-anomaly rate of Eq. 5:
 
-        N_P · (ω_E − Ω̇(a)) = N_D · (n_kep(a) + ω̇(a))
+        N_P * (w_E - Omega_dot(a)) = N_D * (omega_dot(a) + M_dot(a))
 
-    At the returned a, T_r = N_P · 2π/(n_kep + ω̇) = N_D · 2π/(ω_E − Ω̇) and
-    the orbit repeats exactly in ECEF after T_r seconds under the secular J2
-    propagator, making the circulant V matrix exact for ALL entries (including
-    wrap-around ones).  The Keplerian a from _a_km_from_np_nd() is used as the
-    initial guess.
+    At the returned a, T_r = N_D * 2*pi / (w_E - Omega_dot) and the orbit repeats
+    exactly in ECEF after T_r seconds under the secular J2 propagator
+    (propagators/nominal_propagator.py with use_j2=True), making the circulant V
+    matrix exact for ALL entries (including wrap-around ones).  The Keplerian a from
+    _a_km_from_np_nd() is the initial guess.
 
     Parameters
     ----------
@@ -44,37 +64,18 @@ def a_km_j2_rgt(N_P: int, N_D: int, inc_deg: float, earth: EarthConstants) -> fl
     -------
     J2-corrected semi-major axis in km.
     """
-    i_rad = np.deg2rad(inc_deg)
-    cos_i = np.cos(i_rad)
-    cos2_i = cos_i * cos_i
-
     a = _a_km_from_np_nd(N_P, N_D, earth)  # Keplerian initial guess
 
     for _ in range(100):
-        n = np.sqrt(earth.mu_km3_s2 / a**3)
-        fac = 1.5 * earth.j2 * (earth.r_eq_km / a)**2 * n
-        Omegadot = -fac * cos_i
-        omegadot = 0.5 * fac * (5.0 * cos2_i - 1.0)
-
-        f = N_P * (earth.omega_earth_rad_s - Omegadot) - N_D * (n + omegadot)
-
-        # Numerical derivative via central difference (1 m step to avoid cancellation)
+        f = rgt_closure_residual(a, N_P, N_D, inc_deg, earth)
         da = max(a * 1e-7, 1e-4)
-        a2 = a + da
-        n2 = np.sqrt(earth.mu_km3_s2 / a2**3)
-        fac2 = 1.5 * earth.j2 * (earth.r_eq_km / a2)**2 * n2
-        Omega2 = -fac2 * cos_i
-        omega2 = 0.5 * fac2 * (5.0 * cos2_i - 1.0)
-        f2 = N_P * (earth.omega_earth_rad_s - Omega2) - N_D * (n2 + omega2)
-
+        f2 = rgt_closure_residual(a + da, N_P, N_D, inc_deg, earth)
         df_da = (f2 - f) / da
         if abs(df_da) < 1e-40:
             break
-
         step = f / df_da
-        a = float(np.clip(a - step, earth.r_eq_km + 80.0, earth.r_eq_km + 3000.0))
-
-        if abs(step) < 1e-8:
+        a = float(np.clip(a - step, earth.r_eq_km + 80.0, earth.r_eq_km + 40000.0))
+        if abs(step) < 1e-10:
             break
 
     return float(a)
@@ -100,11 +101,13 @@ def rgt_common_ground_track_layer(
     share a single repeating ground track.  Slot k arrives at each ground track point
     exactly k·Δt later than slot 0 (the seed satellite).  This time offset maps to:
 
-        RAAN_k  = RAAN_0 + k · (ω_E − Ω̇) · T_r / L
-        M₀_k    = M₀_0  − k · (2π·N_P/L + ω̇·T_r/L)   (compensates Keplerian advance AND J2 argp drift)
+        RAAN_k  = RAAN_0 + k · (ω_E − Ω̇) · dt
+        M₀_k    = M₀_0  − k · (Ṁ + ω̇) · dt
 
-    where T_r = N_D · T_sidereal, Ω̇ is the J2 secular RAAN rate, and ω̇ is the J2
-    secular argument-of-perigee rate.
+    where dt = T_r / L, Ω̇ / ω̇ are the J2 secular RAAN / argument-of-perigee rates and
+    Ṁ is Lee's J2-corrected mean-anomaly rate (Eq. 5; plain mean motion when
+    use_j2=False).  With J2 on, T_r = N_D · 2π / (ω_E − Ω̇); with J2 off,
+    T_r = N_D · T_sidereal.
 
     NOTE on sign: Earth rotates eastward, so a ground-track point's inertial
     longitude increases with time; the ECEF longitude of the ascending node is
@@ -123,7 +126,9 @@ def rgt_common_ground_track_layer(
     ----------
     inc_deg    : inclination (degrees)
     N_P        : repeat orbits  (numerator of the RGT ratio)
-    N_D        : repeat days    (denominator of the RGT ratio)
+    N_D        : repeat days    (denominator of the RGT ratio); the ratio need not be in
+                 lowest terms (45:3 is a valid rung of a 3-day grid: its track
+                 repeats every T_r/3, so slots k and k + L/3 coincide)
     L          : number of orbital slots = number of time steps in T_r
                  (= round(T_r / dt_s); must match the simulation time axis)
     earth      : EarthConstants
@@ -137,30 +142,22 @@ def rgt_common_ground_track_layer(
     compute v_0.  The full layer is used to recover orbital elements of BILP-
     selected slots after solving.
     """
-    if gcd(N_P, N_D) != 1:
-        raise ValueError(
-            f"N_P={N_P} and N_D={N_D} must be coprime (in lowest terms). "
-            f"Reduce to {N_P//gcd(N_P,N_D)}:{N_D//gcd(N_P,N_D)} first."
-        )
     if L <= 0:
         raise ValueError("L must be > 0")
 
     i_rad = np.deg2rad(inc_deg)
 
     if use_j2:
-        # Use shared reference a_km when provided (multi-inclination constellations).
-        # All sub-constellations must share the same a_km so they share the same
-        # repeat period T_r, keeping the circulant V matrix exact across the sweep.
-        # Fall back to per-inclination J2-correct a_km only for single-inclination use.
+        # a_km_override: seed families (Lee/seed_families.py) pass the exact
+        # (a, i) pair solved for a shared T_r.  Otherwise solve closure at this
+        # inclination (single-family use).
         if a_km_override is not None:
             a_km = float(a_km_override)
         else:
             a_km = a_km_j2_rgt(N_P, N_D, inc_deg, earth)
-        n_kep    = np.sqrt(earth.mu_km3_s2 / a_km**3)
-        fac      = 1.5 * earth.j2 * (earth.r_eq_km / a_km)**2 * n_kep
-        Omegadot = -fac * np.cos(i_rad)
-        omegadot =  0.5 * fac * (5.0 * np.cos(i_rad)**2 - 1.0)
-        T_r      = N_P * 2.0 * np.pi / (n_kep + omegadot)
+        Omegadot, omegadot, Mdot = lee_j2_rates(a_km, inc_deg, earth)
+        n_kep    = Mdot          # along-track mean-anomaly rate incl. Lee's J2 term
+        T_r      = N_D * 2.0 * np.pi / (earth.omega_earth_rad_s - Omegadot)
     else:
         a_km     = _a_km_from_np_nd(N_P, N_D, earth)
         n_kep    = np.sqrt(earth.mu_km3_s2 / a_km**3)
@@ -217,6 +214,11 @@ def rgt_common_ground_track_layer(
         "use_j2":          bool(use_j2),
         "Omegadot_rad_s":  float(Omegadot),
         "omegadot_rad_s":  float(omegadot),
+        "Mdot_rad_s":      float(n_kep),
+        "closure_residual_rad_s": (
+            float(N_P * (earth.omega_earth_rad_s - Omegadot) - N_D * (omegadot + n_kep))
+            if use_j2 else 0.0
+        ),
     }
 
     return Layer(elems=elems, phys=phys, spec=spec)

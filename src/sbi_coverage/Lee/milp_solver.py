@@ -433,7 +433,7 @@ def solve_sclp(
 # Post-processing helpers
 # ---------------------------------------------------------------------------
 
-def build_orb_elems_table(sub_layers: list[Layer], L: int) -> np.ndarray:
+def build_orb_elems_table(sub_layers: list[Layer], L: int, n_cols_per_seed: list[int] | None = None) -> np.ndarray:
     """Build the orbital elements table for all orbital slots.
 
     Parameters
@@ -442,6 +442,8 @@ def build_orb_elems_table(sub_layers: list[Layer], L: int) -> np.ndarray:
         One Layer per sub-constellation (inclination), each containing L slots.
     L : int
         Number of orbital slots per sub-constellation (= number of time steps).
+    n_cols_per_seed : list of int, optional
+        Slots kept per sub-constellation (must match build_param_V); default L each.
 
     Returns
     -------
@@ -451,20 +453,25 @@ def build_orb_elems_table(sub_layers: list[Layer], L: int) -> np.ndarray:
         sub-constellation 0 slots 0..L-1, then sub-constellation 1, etc.
         arg_lat_deg = argp_deg + M0_deg  (equals M0_deg for circular orbits).
     """
-    n_orb_slots = len(sub_layers) * L
+    if n_cols_per_seed is None:
+        n_cols_per_seed = [L] * len(sub_layers)
+    n_orb_slots = int(sum(n_cols_per_seed))
     orb_elems = np.zeros((n_orb_slots, 6), dtype=np.float64)
+    start = 0
     for s, layer in enumerate(sub_layers):
         e = layer.elems
-        start = s * L
-        orb_elems[start:start + L, 0] = np.asarray(e.a_km,     dtype=np.float64)
-        orb_elems[start:start + L, 1] = np.asarray(e.e,        dtype=np.float64)
-        orb_elems[start:start + L, 2] = np.rad2deg(np.asarray(e.i_rad,    dtype=np.float64))
-        orb_elems[start:start + L, 3] = np.rad2deg(np.asarray(e.raan_rad, dtype=np.float64))
-        orb_elems[start:start + L, 4] = np.rad2deg(np.asarray(e.argp_rad, dtype=np.float64))
-        orb_elems[start:start + L, 5] = np.rad2deg(
-            np.asarray(e.argp_rad, dtype=np.float64)
-            + np.asarray(e.M0_rad,  dtype=np.float64)
+        m = int(n_cols_per_seed[s])
+        sl = slice(0, m)
+        orb_elems[start:start + m, 0] = np.asarray(e.a_km,     dtype=np.float64)[sl]
+        orb_elems[start:start + m, 1] = np.asarray(e.e,        dtype=np.float64)[sl]
+        orb_elems[start:start + m, 2] = np.rad2deg(np.asarray(e.i_rad,    dtype=np.float64))[sl]
+        orb_elems[start:start + m, 3] = np.rad2deg(np.asarray(e.raan_rad, dtype=np.float64))[sl]
+        orb_elems[start:start + m, 4] = np.rad2deg(np.asarray(e.argp_rad, dtype=np.float64))[sl]
+        orb_elems[start:start + m, 5] = np.rad2deg(
+            np.asarray(e.argp_rad, dtype=np.float64)[sl]
+            + np.asarray(e.M0_rad,  dtype=np.float64)[sl]
         )
+        start += m
     return orb_elems
 
 

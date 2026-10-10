@@ -10,7 +10,7 @@ This tells us whether coverage gaps are:
 
 Usage:
     python scripts/diagnose_coverage_gaps.py
-    python scripts/diagnose_coverage_gaps.py path/to/result.csv
+    python scripts/diagnose_coverage_gaps.py <run name | path to _result.csv | s3://.../runs/<name>_result.csv>
 """
 from __future__ import annotations
 
@@ -25,30 +25,21 @@ from sbi_coverage.core.config import EarthConstants, SimConfig, CoverageConfig, 
 from sbi_coverage.core.elements import OrbitalElements, SatellitePhysical
 from sbi_coverage.core.shell import Shell
 from sbi_coverage.core.simulate import run_simulation
+from sbi_coverage.runindex import resolve_run_files
 
 # ---------------------------------------------------------------------------
 # Config — point to the result you want to diagnose
 # ---------------------------------------------------------------------------
-RESULT_CSV: Path | None = Path(r"results\china\burnout-vel-4.0km-s\intercept-window-170s\intercept-alt-200km\max-accel-10.0g\orbit-alt-262km\interceptors-per-sat-1\salvo-size-1\20260612_145418_result.csv"
-)
+RESULT: str | None = None   # run name, local _result.csv path, or S3 URI/key; CLI argument overrides
+RESULTS_DIR = Path(__file__).resolve().parents[1] / "results"
 
 N_ZERO_PAIRS_TO_PRINT = 20   # how many specific uncovered (j, target_idx) to show
 
 
 # ---------------------------------------------------------------------------
-def _resolve_csv(arg: Path | None) -> Path:
-    if arg and arg.exists():
-        return arg
-    if len(sys.argv) > 1:
-        p = Path(sys.argv[1])
-        if p.exists():
-            return p
-    # auto-find newest
-    results_dir = Path(__file__).resolve().parents[1] / "results"
-    csvs = sorted(results_dir.rglob("*_result.csv"), key=lambda p: p.stat().st_mtime)
-    if not csvs:
-        raise FileNotFoundError("No *_result.csv found under results/")
-    return csvs[-1]
+def _resolve_csv(arg: str | None) -> Path:
+    csv_path, _ = resolve_run_files(sys.argv[1] if len(sys.argv) > 1 else arg, RESULTS_DIR)
+    return csv_path
 
 
 def _load_orb_csv(csv_path: Path) -> np.ndarray:
@@ -67,7 +58,7 @@ def _load_orb_csv(csv_path: Path) -> np.ndarray:
 
 
 def main() -> None:
-    csv_path  = _resolve_csv(RESULT_CSV)
+    csv_path  = _resolve_csv(RESULT)
     json_path = csv_path.with_suffix(".json")
     if not json_path.exists():
         raise FileNotFoundError(f"JSON sidecar not found: {json_path}")
@@ -78,7 +69,7 @@ def main() -> None:
     orb_arr = _load_orb_csv(csv_path)
     n_sats  = orb_arr.shape[0]
     print(f"Loaded {n_sats} satellites from {csv_path.name}")
-    print(f"  MIP gap at save time: {cfg.get('mip_gap', 0.0)*100:.4f}%")
+    print(f"  MIP gap at save time: {(cfg.get('mip_gap') or 0.0)*100:.4f}%")
 
     earth = EarthConstants()
 

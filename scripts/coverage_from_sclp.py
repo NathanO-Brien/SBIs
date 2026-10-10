@@ -3,18 +3,19 @@ coverage_from_sclp.py
 
 Post-optimization coverage analysis for a constellation selected by lee_test2.py.
 
-Reads the CSV + JSON sidecar produced by lee_test2.py, reconstructs the orbital
+Reads the run's CSV + JSON sidecar (local, or fetched from the flat S3 runs/ prefix), reconstructs the orbital
 elements and all simulation parameters, and runs a coverage simulation with
 optional orbit plotting and video generation — no layer definitions required.
 
 Usage:
     python scripts/coverage_from_sclp.py                             # auto-finds newest result
-    python scripts/coverage_from_sclp.py results/sclp_result_<ts>.csv
+    python scripts/coverage_from_sclp.py <run name | path to _result.csv | s3://.../runs/<name>_result.csv>
 """
 from __future__ import annotations
 
 import csv
 import json
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ from sbi_coverage.core.shell import Shell
 from sbi_coverage.core.simulate import run_simulation
 from sbi_coverage.core.plotting import plot_initial_orbits, render_coverage_video_mercator
 from sbi_coverage.core.output_report import report
+from sbi_coverage.runindex import resolve_run_files
 
 
 # ---------------------------------------------------------------------------
@@ -35,8 +37,8 @@ from sbi_coverage.core.output_report import report
 # Leave as None to auto-select the newest result in RESULTS_DIR, or pass
 # the path as a command-line argument.
 # ---------------------------------------------------------------------------
-RESULT_CSV: Path | None = Path(r"results\china\burnout-vel-4.0km-s\intercept-window-170s\intercept-alt-200km\max-accel-10.0g\orbit-alt-262km\interceptors-per-sat-1\salvo-size-1\20260612_195842_result.csv")
-RESULTS_DIR: Path = Path(__file__).resolve().parents[1] / "results"
+RESULT: str | None = None   # run name, local _result.csv path, or S3 URI/key (e.g. s3://sbi-optimization-runs/runs/<name>_result.csv)
+RESULTS_DIR: Path = Path(__file__).resolve().parents[1] / "results"   # flat folder; S3 runs are downloaded here
 
 # ---------------------------------------------------------------------------
 # Optional reporting/rendering countries override
@@ -80,22 +82,9 @@ COVERAGE_VIDEO_OUTPUT_PATH: str | None = None   # None = auto-named in docs/vide
 # ---------------------------------------------------------------------------
 
 def _resolve_csv_path() -> Path:
-    if RESULT_CSV is not None:
-        return Path(RESULT_CSV)
-    # Sweep results: results/**/*_result.csv  (nested subdirs, timestamp prefix)
-    # Legacy lee_test2 results: results/sclp_result_*.csv  (flat)
-    candidates = sorted(
-        RESULTS_DIR.rglob("*_result.csv"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if not candidates:
-        raise FileNotFoundError(
-            f"No *_result.csv found under {RESULTS_DIR}. "
-            "Run sweep_optimize.py first, or set RESULT_CSV above."
-        )
-    print(f"Auto-selected newest result: {candidates[0].relative_to(RESULTS_DIR)}")
-    return candidates[0]
+    target = sys.argv[1] if len(sys.argv) > 1 else RESULT
+    csv_path, _ = resolve_run_files(target, RESULTS_DIR)
+    return csv_path
 
 
 def _load_orb_csv(csv_path: Path) -> np.ndarray:
@@ -142,7 +131,7 @@ def main() -> None:
 
     print(f"Loaded {n_sats} satellites from {csv_path.name}")
     print(f"  Status  : {cfg.get('status_str', '?')}")
-    print(f"  MIP gap : {cfg.get('mip_gap', 0.0) * 100:.4f}%")
+    print(f"  MIP gap : {(cfg.get('mip_gap') or 0.0) * 100:.4f}%")
     print(f"  Salvo   : {salvo_size} KVs  |  {n_interceptors_per_sat} KV/sat  |  r_required = {r_required} SBIs")
     report_countries = (
         [str(country).strip() for country in REPORT_COUNTRIES_OVERRIDE if str(country).strip()]

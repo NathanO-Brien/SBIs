@@ -4,7 +4,7 @@ from .elements import OrbitalElements, SatellitePhysical
 from .output_report import report
 from .shell import Shell
 from .simulate import run_simulation
-from .target_points import load_target_points_csv, smart_inclination_bounds
+from .target_points import load_target_points_csv
 
 __all__ = [
     "Analysis",
@@ -19,5 +19,4 @@ __all__ = [
     "run_simulation",
     "report",
     "load_target_points_csv",
-    "smart_inclination_bounds",
 ]
