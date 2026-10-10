@@ -15,7 +15,7 @@ TEST-NKp-s005-d15-v6-g10-b170-k0-i1-261009a-6dff_result.csv / _result.json / _gu
 
 Usage:
     python scripts/lee_test2.py
-Browse results with:  streamlit run scripts/run_browser.py -- --folder results
+Browse cloud results with:  streamlit run scripts/sbi_gui.py
 """
 from __future__ import annotations
 

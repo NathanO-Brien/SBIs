@@ -16,7 +16,7 @@ Examples:
     python scripts/cloud_run.py ... --dry-run           # print the run identity and config, submit nothing
 
 Results land flat in s3://sbi-optimization-runs/runs/<run name>_*; browse them with
-streamlit run scripts/run_browser.py. Tolerances you do not pass use CONFIG_DEFAULTS, except the time
+streamlit run scripts/sbi_gui.py. Tolerances you do not pass use CONFIG_DEFAULTS, except the time
 limit (default 4 h here).
 """
 from __future__ import annotations
@@ -135,7 +135,7 @@ def main() -> None:
     print(f"Config uploaded to {uri}")
     job_id = submit_job(batch, job_name=cfg["job_name"], s3_config_uri=uri)
     print(f"\nJob submitted.\n  Job ID : {job_id}\n  Status : aws batch describe-jobs --jobs {job_id} --query \"jobs[0].status\"")
-    print(f"  Output : s3://{S3_BUCKET}/runs/   (browse: streamlit run scripts/run_browser.py)")
+    print(f"  Output : s3://{S3_BUCKET}/runs/   (browse: streamlit run scripts/sbi_gui.py)")
 
 
 if __name__ == "__main__":

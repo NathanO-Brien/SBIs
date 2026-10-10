@@ -2,7 +2,7 @@
 
     python scripts/sync_results_from_s3.py [--folder results] [--scenario NK] [--all-products] [--overwrite]
 
-Only files missing locally are downloaded (unless --overwrite). Browse them with scripts/run_browser.py.
+Only files missing locally are downloaded (unless --overwrite). Browse them with scripts/sbi_gui.py.
 (The old nested country/ and prespecified/ layout was archived under archive-nonj2-20261009/.)
 """
 import argparse

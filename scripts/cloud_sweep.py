@@ -181,7 +181,7 @@ def main() -> None:
     verb = "would run" if a.dry_run else ("ran" if a.local else "submitted")
     print(f"{verb}: {submitted}   skipped: {skipped}   failed: {failed}")
     if not a.local and not a.dry_run:
-        print(f"Output: s3://{S3_BUCKET}/runs/   (browse: streamlit run scripts/run_browser.py)")
+        print(f"Output: s3://{S3_BUCKET}/runs/   (browse: streamlit run scripts/sbi_gui.py)")
     print("=" * 70)
     if failed:
         sys.exit(1)
