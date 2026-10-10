@@ -2,7 +2,7 @@
 
     streamlit run scripts/run_browser.py -- --folder results
 
-Runs are flat files named by sbi_coverage.runnames, so everything here is derived from
+Runs are flat files named by sbi_coverage.runs.names, so everything here is derived from
 file names plus each run's _result.json sidecar.  Tabs:
   Runs     table of every run (filter by any subset of inputs), name decoder, "does it exist?" check
   Compare  salvo size vs number of satellites for one scenario, one curve per detection time /
@@ -19,8 +19,8 @@ import plotly.express as px
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from sbi_coverage.runindex import S3_BUCKET, load_index, sync_from_s3  # noqa: E402
-from sbi_coverage.runnames import decode_run_name  # noqa: E402
+from sbi_coverage.runs.index import S3_BUCKET, load_index, sync_from_s3  # noqa: E402
+from sbi_coverage.runs.names import decode_run_name  # noqa: E402
 
 FILTER_COLS = {
     "scenario": "Scenario", "principal": "Principal set", "salvo_size": "Salvo", "detection_time_s": "Detection [s]",

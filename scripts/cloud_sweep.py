@@ -14,7 +14,7 @@ Edit the SWEEP_* constants below to define the parameter grid, then run:
     python scripts/cloud_sweep.py
 
 Results land flat in S3 runs/ with a short decodable name per combination
-(see sbi_coverage.runnames).
+(see sbi_coverage.runs.names).
 
 To dry-run without submitting jobs (prints what would be submitted):
     python scripts/cloud_sweep.py --dry-run
@@ -32,7 +32,7 @@ from pathlib import Path
 import boto3
 
 from sbi_coverage.core.target_points import load_target_points_csv
-from sbi_coverage.runnames import (decode_run_name, scenario_from_path, settings_from_config,
+from sbi_coverage.runs.names import (decode_run_name, scenario_from_path, settings_from_config,
                                     settings_key)
 
 # ---------------------------------------------------------------------------
@@ -90,7 +90,7 @@ RUN_NAME: str | None = "Prespecified_100_ICBMS_CN_High_Priority_PRINCIPAL"
 IS_PRINCIPAL_SET: bool = True
 # Existence check. False (default): every combination is submitted, layering new runs on top of
 # whatever is already in runs/ (same-day reruns get the next sequence letter). True: skip a combo
-# whose run identity (see sbi_coverage.runnames.settings_key, any date) already exists in S3.
+# whose run identity (see sbi_coverage.runs.names.settings_key, any date) already exists in S3.
 # The --skip-existing command-line flag turns this on for one launch.
 SKIP_EXISTING: bool = False
 # Short scenario code used in run names (e.g. "CN"). None -> inferred from the CSV path
@@ -178,7 +178,7 @@ def _config_for(
 def _results_exist(s3: "boto3.client", bucket: str, cfg: dict) -> bool:
     """True if a lee_j2 result with the same run identity (any date) is already in S3.
 
-    Run names are flat under runs/ (see sbi_coverage.runnames): the identity is the
+    Run names are flat under runs/ (see sbi_coverage.runs.names): the identity is the
     readable settings tokens plus a hash of everything else, so a run made with a
     different RAAN step, margin, target set, ... is correctly NOT a duplicate. Results
     from the older J2-off pipeline live under country/ and prespecified/ (archived) and

@@ -24,7 +24,7 @@ import numpy as np
 from sbi_coverage.core.config import CoverageConfig, EarthConstants, SimConfig
 from sbi_coverage.core.shell import Shell
 from sbi_coverage.core.target_points import load_target_points_csv
-from sbi_coverage.runnames import local_run_id, settings_from_config, settings_key
+from sbi_coverage.runs.names import local_run_id, settings_from_config, settings_key
 from sbi_coverage.Lee import (
     build_orb_elems_table,
     build_seed_pool,

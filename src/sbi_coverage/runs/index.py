@@ -1,10 +1,10 @@
 """Index of run results in a flat folder (and the flat S3 ``runs/`` prefix).
 
-Run files are named ``<run name>_<product>`` (see :mod:`sbi_coverage.runnames`), so the
+Run files are named ``<run name>_<product>`` (see :mod:`sbi_coverage.runs.names`), so the
 index is built from the file names plus each run's ``_result.json`` sidecar -- no database.
 Used by ``scripts/run_browser.py``; importable on its own for scripting::
 
-    from sbi_coverage.runindex import load_index
+    from sbi_coverage.runs.index import load_index
     df = load_index("results")
     df[(df.scenario == "CN") & (df.detection_time_s == 15)]
 """
@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
-from .runnames import decode_run_name, parse_filename
+from .names import decode_run_name, parse_filename
 
 S3_BUCKET = "sbi-optimization-runs"
 S3_RUNS_PREFIX = "runs/"

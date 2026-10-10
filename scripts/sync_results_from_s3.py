@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from sbi_coverage.runindex import PRODUCTS, S3_BUCKET, sync_from_s3  # noqa: E402
+from sbi_coverage.runs.index import PRODUCTS, S3_BUCKET, sync_from_s3  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--folder", default="results")

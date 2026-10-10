@@ -39,7 +39,7 @@ _CONFIG_DEFAULTS below for the full set:
     }
 
 Outputs uploaded flat to s3://<S3_BUCKET>/[<S3_PREFIX>/]runs/ (no subfolders). <run> is the
-short run name from sbi_coverage.runnames, e.g. CNP-s046-d15-v6-g10-b170-k0-i1-261009a-6dff:
+short run name from sbi_coverage.runs.names, e.g. CNP-s046-d15-v6-g10-b170-k0-i1-261009a-6dff:
     <run>_result.csv        Orbital elements of selected satellites.
     <run>_result.json       Full simulation config sidecar
                             (compatible with coverage_from_sclp.py).
@@ -62,7 +62,7 @@ import numpy as np
 
 from sbi_coverage.core.config import CoverageConfig, EarthConstants, SimConfig
 from sbi_coverage.core.shell import Shell
-from sbi_coverage.runnames import encode_run_name, next_seq, parse_filename, settings_from_config, settings_key
+from sbi_coverage.runs.names import encode_run_name, next_seq, parse_filename, settings_from_config, settings_key
 from sbi_coverage.core.simulate import run_simulation
 from sbi_coverage.Lee import (
     build_orb_elems_table,

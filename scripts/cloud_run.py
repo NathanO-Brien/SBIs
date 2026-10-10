@@ -27,7 +27,7 @@ import re
 import boto3
 
 from sbi_coverage.core.target_points import load_target_points_csv
-from sbi_coverage.runnames import scenario_from_path, settings_from_config, settings_key
+from sbi_coverage.runs.names import scenario_from_path, settings_from_config, settings_key
 
 # ---------------------------------------------------------------------------
 # AWS / S3 configuration

@@ -32,7 +32,7 @@ from sbi_coverage.core.config import EarthConstants, SimConfig, CoverageConfig, 
 from sbi_coverage.core.elements import OrbitalElements, SatellitePhysical
 from sbi_coverage.core.shell import Shell
 from sbi_coverage.core.simulate import run_simulation
-from sbi_coverage.runindex import resolve_run_files
+from sbi_coverage.runs.index import resolve_run_files
 
 
 def _load_orb_csv(csv_path: Path) -> np.ndarray:

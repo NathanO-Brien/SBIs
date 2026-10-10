@@ -1,4 +1,4 @@
-"""Self-checks for sbi_coverage.runnames (round trip, collisions, length, key stability)."""
+"""Self-checks for sbi_coverage.runs.names (round trip, collisions, length, key stability)."""
 import datetime
 import random
 import re
@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from sbi_coverage.runnames import (decode_run_name, encode_run_name, find_runs, next_seq,
+from sbi_coverage.runs.names import (decode_run_name, encode_run_name, find_runs, next_seq,
                                    parse_filename, settings_key)
 
 rng = random.Random(7)

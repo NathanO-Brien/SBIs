@@ -29,7 +29,7 @@ from sbi_coverage.core.shell import Shell
 from sbi_coverage.core.simulate import run_simulation
 from sbi_coverage.core.plotting import plot_initial_orbits, render_coverage_video_mercator
 from sbi_coverage.core.output_report import report
-from sbi_coverage.runindex import resolve_run_files
+from sbi_coverage.runs.index import resolve_run_files
 
 
 # ---------------------------------------------------------------------------

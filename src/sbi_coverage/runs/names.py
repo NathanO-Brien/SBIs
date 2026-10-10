@@ -32,11 +32,11 @@ the name without date/sequence, so "does this run already exist?" ignores *when*
 
 Usage::
 
-    from sbi_coverage.runnames import encode_run_name, decode_run_name, settings_key
+    from sbi_coverage.runs.names import encode_run_name, decode_run_name, settings_key
     name = encode_run_name(settings)           # settings: dict, see SETTING_KEYS
     info = decode_run_name(name)               # dict of readable fields + date + hash
-    python -m sbi_coverage.runnames encode settings.json
-    python -m sbi_coverage.runnames decode CNP-s046-d15-v6-g10-b170-k0-i1-261009a-3f9c
+    python -m sbi_coverage.runs.names encode settings.json
+    python -m sbi_coverage.runs.names decode CNP-s046-d15-v6-g10-b170-k0-i1-261009a-3f9c
 """
 from __future__ import annotations
 
