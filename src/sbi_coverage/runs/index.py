@@ -73,7 +73,8 @@ def read_sidecar(json_path: str | Path) -> dict[str, Any]:
     return normalize_sidecar(json.loads(Path(json_path).read_text(encoding="utf-8")))
 
 
-def _fill_from_sidecar(row: dict[str, Any], data: dict[str, Any], json_path: Path) -> dict[str, Any]:
+def fill_row_from_sidecar(row: dict[str, Any], data: dict[str, Any], has_csv: bool | None = None) -> dict[str, Any]:
+    """Add the result/run_config columns of a (any-schema) sidecar dict to a decoded-name row."""
     sc = normalize_sidecar(data)
     rc, res = sc["run_config"], sc["result"]
     row["n_satellites"] = res.get("n_satellites")
@@ -94,7 +95,7 @@ def _fill_from_sidecar(row: dict[str, Any], data: dict[str, Any], json_path: Pat
     row["target_lat_span_deg"] = sg.get("target_lat_span_deg")
     row["n_alt_inc_combos"] = sg.get("n_unique_alt_inc_combos_all_candidates")
     row["git_commit"] = (sc.get("provenance") or {}).get("git_commit")
-    row["has_csv"] = json_path.with_suffix(".csv").exists()
+    row["has_csv"] = has_csv
     return row
 
 
@@ -112,7 +113,7 @@ def _row(json_path: Path) -> dict[str, Any] | None:
             row["status_note"] = "failed (unreadable record)"
         return row
     try:
-        return _fill_from_sidecar(row, json.loads(json_path.read_text(encoding="utf-8")), json_path)
+        return fill_row_from_sidecar(row, json.loads(json_path.read_text(encoding="utf-8")), json_path.with_suffix(".csv").exists())
     except Exception as exc:  # one bad/legacy file must never break the whole index
         row["status_note"] = f"unreadable sidecar: {type(exc).__name__}"
         return row

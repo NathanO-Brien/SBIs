@@ -81,3 +81,36 @@ def predefined_shell(sidecar: dict[str, Any], earth: EarthConstants, cov: Covera
     labels, lats, lons = target_arrays(sidecar)
     return Shell.from_points(earth, lat_deg=lats, lon_deg=lons, shell_alt_km=cov.intercept_alt_km,
                              meta_extra={"labels": labels, "roi": "stored target points"})
+
+
+def orb_from_csv_text(text: str) -> np.ndarray:
+    """Same as load_orb_csv but from CSV text (e.g. downloaded from S3); no local file needed."""
+    import io
+    rows = [[float(row[k]) for k in ("a_km", "e", "i_deg", "raan_deg", "argp_deg", "arg_lat_deg")]
+            for row in csv.DictReader(io.StringIO(text))]
+    if not rows:
+        raise ValueError("satellite CSV contains no data rows")
+    return np.array(rows, dtype=np.float64)
+
+
+def coverage_check(sidecar: dict[str, Any], orb: np.ndarray) -> dict[str, Any]:
+    """Re-simulate a stored constellation with the current code and summarize per-target coverage.
+
+    Returns dict(n_targets, n_covered, min_count, mean_count, required, per_target (name, min_count,
+    fraction_under) list for under-covered targets).
+    """
+    from ..core.simulate import run_simulation
+
+    earth, cov, sim = replay_configs(sidecar)
+    labels, _, _ = target_arrays(sidecar)
+    shell = predefined_shell(sidecar, earth, cov)
+    ao = run_simulation(elements_from_orb(orb), sim, cov, earth, shell, [{"type": "stored-result", "n_total": int(orb.shape[0])}],
+                        propagator=PROPAGATOR, build_meta=False)
+    counts = ao.counts.astype(np.int32)
+    need = int(sidecar.get("run_config", {}).get("r_required", 1))
+    min_per = counts.min(axis=0)
+    under = (counts < need).mean(axis=0)
+    bad = [{"target": labels[i], "min_count": int(min_per[i]), "fraction_of_steps_under": float(under[i])}
+           for i in np.argsort(min_per) if min_per[i] < need]
+    return {"n_targets": int(counts.shape[1]), "n_covered": int((min_per >= need).sum()), "min_count": int(counts.min()),
+            "mean_count": float(counts.mean()), "required": need, "under_covered": bad}
