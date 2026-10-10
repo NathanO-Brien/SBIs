@@ -1,22 +1,5 @@
-from .analysis_matrix import Analysis, AnalysisMatrix, shell_id_from_latlon
-from .config import CoverageConfig, EarthConstants, SimConfig
-from .elements import OrbitalElements, SatellitePhysical
-from .output_report import report
-from .shell import Shell
-from .simulate import run_simulation
-from .target_points import load_target_points_csv
+"""Physics/geometry core: configs, shell/target points, coverage kernels, propagation driver, plotting and reports.
 
-__all__ = [
-    "Analysis",
-    "AnalysisMatrix",
-    "shell_id_from_latlon",
-    "CoverageConfig",
-    "EarthConstants",
-    "SimConfig",
-    "OrbitalElements",
-    "SatellitePhysical",
-    "Shell",
-    "run_simulation",
-    "report",
-    "load_target_points_csv",
-]
+Import the submodules directly (``from sbi_coverage.core.config import CoverageConfig``); this package
+re-exports nothing, so importing it does not pull in geopandas/matplotlib.
+"""

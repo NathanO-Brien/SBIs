@@ -2,14 +2,13 @@
 parameters, and simulation settings.
 """
 from dataclasses import dataclass, field
-from typing import Optional
 
 from .engagement import interceptor_range_km
 
 
 @dataclass(frozen=True)
 class EarthConstants:
-    """Physical constants for a spherical-Earth model (WGS-84 values)."""
+    """Physical constants for a spherical-Earth model (WGS-84 values; r_eq_km is used as the sphere radius)."""
     mu_km3_s2: float = 398600.4418            # gravitational parameter, km^3/s^2
     r_eq_km: float = 6378.137                 # equatorial radius, km
     j2: float = 1.08262668e-3                 # J2 zonal harmonic coefficient
@@ -36,7 +35,7 @@ class CoverageConfig:
     The key derived value is `max_range_km`: the maximum straight-line
     distance an interceptor can travel within interceptor_engagement_time_s,
     computed from the accelerate-then-coast performance model in
-    engagement.interceptor_range_km() unless explicitly overridden.
+    engagement.interceptor_range_km() (a straight-line, gravity-free flyout model).
     """
 
     # Engagement / sizing inputs
@@ -44,15 +43,12 @@ class CoverageConfig:
     detection_time_s: float             # time from target launch to detection, s
     decision_time_s: float              # time from detection to engage decision, s
     target_missile_burnout_time_s: float  # time from target launch to target burnout, s
-    v_bo_km_s: float           # interceptor burnout velocity, km/s
-    a_g: float                 # interceptor acceleration, g's
-    intercept_alt_km: float    # intercept altitude above Earth surface, km
+    burnout_velocity_km_s: float  # interceptor burnout velocity, km/s
+    max_accel_g: float            # interceptor maximum acceleration, in multiples of g0
+    intercept_alt_km: float       # altitude above the surface of the target points (the intercept shell), km
 
     # Coverage geometry
     min_elev_deg: float = 10.0  # minimum elevation of satellite above target's local horizon
-
-    # Optional override of the derived reach (for experiments)
-    max_range_km_override: Optional[float] = None
 
     # Derived timing and interceptor reach (computed in __post_init__)
     interceptor_engagement_time_s: float = field(init=False)
@@ -65,10 +61,10 @@ class CoverageConfig:
             raise ValueError("CoverageConfig: decision_time_s must be >= 0")
         if self.target_missile_burnout_time_s <= 0.0:
             raise ValueError("CoverageConfig: target_missile_burnout_time_s must be > 0")
-        if self.v_bo_km_s <= 0.0:
-            raise ValueError("CoverageConfig: v_bo_km_s must be > 0")
-        if self.a_g <= 0.0:
-            raise ValueError("CoverageConfig: a_g must be > 0")
+        if self.burnout_velocity_km_s <= 0.0:
+            raise ValueError("CoverageConfig: burnout_velocity_km_s must be > 0")
+        if self.max_accel_g <= 0.0:
+            raise ValueError("CoverageConfig: max_accel_g must be > 0")
 
         engagement_time = (
             self.target_missile_burnout_time_s - self.detection_time_s - self.decision_time_s
@@ -82,33 +78,29 @@ class CoverageConfig:
             )
         object.__setattr__(self, "interceptor_engagement_time_s", engagement_time)
 
-        if self.max_range_km_override is not None:
-            max_range = float(self.max_range_km_override)
-        else:
-            max_range = float(
-                interceptor_range_km(
-                    T_s=float(engagement_time),
-                    v_km_s=float(self.v_bo_km_s),
-                    a_g=float(self.a_g),
-                    g0_m_s2=float(getattr(self.earth, "g0_m_s2", 9.80665)),
-                )
+        max_range = float(
+            interceptor_range_km(
+                T_s=float(engagement_time),
+                v_km_s=float(self.burnout_velocity_km_s),
+                a_g=float(self.max_accel_g),
+                g0_m_s2=float(self.earth.g0_m_s2),
             )
+        )
 
         object.__setattr__(self, "max_range_km", max_range)
 
 
-def coverage_config_from_sidecar(c: dict, earth: EarthConstants, **overrides) -> "CoverageConfig":
+def coverage_config_from_sidecar(c: dict, earth: EarthConstants) -> "CoverageConfig":
     """Reconstruct a CoverageConfig from a saved result JSON's "cov" block.
 
-    Supports both schemas: a current sidecar (detection_time_s/decision_time_s/
+    Accepts current keys (burnout_velocity_km_s, max_accel_g) and the pre-rename keys
+    (v_bo_km_s, a_g). Supports both timing schemas: a current sidecar (detection_time_s/decision_time_s/
     target_missile_burnout_time_s) is used directly. A legacy sidecar (only
     "T_window_s", from before the detection/decision timing split) is read as
     detection_time_s=0, decision_time_s=0, target_missile_burnout_time_s=
     T_window_s -- exactly the old behavior, where the whole window was
     dedicated to interceptor flyout.
 
-    overrides are passed through to CoverageConfig(...), taking precedence
-    over the sidecar's own values (e.g. min_elev_deg, max_range_km_override).
     """
     if "target_missile_burnout_time_s" in c:
         detection_time_s = float(c["detection_time_s"])
@@ -124,12 +116,11 @@ def coverage_config_from_sidecar(c: dict, earth: EarthConstants, **overrides) ->
         detection_time_s=detection_time_s,
         decision_time_s=decision_time_s,
         target_missile_burnout_time_s=target_missile_burnout_time_s,
-        v_bo_km_s=float(c["v_bo_km_s"]),
-        a_g=float(c["a_g"]),
+        burnout_velocity_km_s=float(c.get("burnout_velocity_km_s", c.get("v_bo_km_s"))),
+        max_accel_g=float(c.get("max_accel_g", c.get("a_g"))),
         intercept_alt_km=float(c["intercept_alt_km"]),
         min_elev_deg=float(c["min_elev_deg"]),
     )
-    kwargs.update(overrides)
     return CoverageConfig(**kwargs)
 
 
@@ -145,20 +136,13 @@ class SimConfig:
     # Epoch identifier stored for reproducibility (currently "J2000" only).
     epoch0: str = "J2000"
 
-    # Propagation toggles
+    # Propagation model. use_j2=True is the Lee (2020) secular-J2 model (RAAN, argument of
+    # perigee and mean-anomaly rates) and is the only model the optimizer uses; False is plain
+    # two-body motion, kept only so J2-off results archived before the J2 work can be replayed.
     use_j2: bool = True
-    use_drag: bool = False
 
-    # Exponential atmosphere model for the nominal propagator when use_drag=True:
-    #   rho(h) = rho_scale * rho0_kg_m3 * exp(-(h - h0_km) / H_km)
-    rho0_kg_m3: float = 3.614e-13
-    h0_km: float = 700.0
-    H_km: float = 88.667
-    rho_scale: float = 1.0
-    drag_floor_alt_km: float = 120.0   # below this altitude the satellite is considered decayed
-
-    # Storage dtype for the coverage counts matrix. uint8 halves storage but
-    # clips counts above 255; uint16 is safer for large constellations.
+    # Storage dtype for the coverage counts matrix. uint8 halves storage but counts above 255
+    # wrap modulo 256 (a warning is printed); uint16 is safer for large constellations.
     analysis_matrix_dtype: str = "uint16"
 
     def __post_init__(self):
@@ -168,9 +152,3 @@ class SimConfig:
                 f"SimConfig: analysis_matrix_dtype must be one of {sorted(valid)}, "
                 f"got {self.analysis_matrix_dtype!r}"
             )
-        if self.H_km <= 0.0:
-            raise ValueError("SimConfig: H_km must be > 0")
-        if self.rho0_kg_m3 < 0.0:
-            raise ValueError("SimConfig: rho0_kg_m3 must be >= 0")
-        if self.rho_scale < 0.0:
-            raise ValueError("SimConfig: rho_scale must be >= 0")

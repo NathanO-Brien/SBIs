@@ -37,7 +37,6 @@ def plot_initial_orbits(
     t0_s: float = 0.0,
     frame: str = "ECI",
     show_earth: bool = True,
-    earth_texture_path: str | None = None,
     show_points: bool = True,
     show_orbits: bool = True,
     max_orbits: int | None = None,
@@ -52,7 +51,6 @@ def plot_initial_orbits(
     save_path: str | None = None,
 ):
     """Plot epoch satellite states and full orbits, color-coded by layer."""
-    del earth_texture_path
     a_km, e, inc, raan, argp, M0 = _extract_elements(elems0)
     ns = int(a_km.size)
     if ns == 0:
@@ -147,14 +145,9 @@ def plot_initial_orbits(
     return fig, ax
 
 
-def render_coverage_video_mercator(
+def render_coverage_video(
     ao: Analysis,
     *,
-    elems0: Any | None = None,
-    phys: Any | None = None,
-    sim: Any | None = None,
-    earth: Any | None = None,
-    propagator: str = "Nominal_Propagator",
     stats_countries: list[str] | None = None,
     stats_ao: Analysis | None = None,
     fps: int = 60,
@@ -169,7 +162,7 @@ def render_coverage_video_mercator(
     progress_every_percent: int = 10,
     r_required: int = 1,
 ) -> dict[str, Any]:
-    """Render an MP4 of shell-point coverage over time on an oval world projection.
+    """Render an MP4 of shell-point coverage over time on a Mollweide (oval) world map.
 
     Notes
     -----
@@ -181,26 +174,26 @@ def render_coverage_video_mercator(
       analysis object, so non-ROI points cannot be drawn from that input alone.
     """
     if not isinstance(ao, Analysis):
-        raise TypeError("render_coverage_video_mercator(): ao must be an Analysis")
+        raise TypeError("render_coverage_video(): ao must be an Analysis")
     if imageio is None:
         raise RuntimeError(
-            "render_coverage_video_mercator(): imageio is not available. "
+            "render_coverage_video(): imageio is not available. "
             "Install `imageio` and `imageio-ffmpeg` for MP4 export."
         )
     if int(fps) <= 0:
-        raise ValueError("render_coverage_video_mercator(): fps must be >= 1")
+        raise ValueError("render_coverage_video(): fps must be >= 1")
     if int(progress_every_percent) <= 0 or int(progress_every_percent) > 100:
-        raise ValueError("render_coverage_video_mercator(): progress_every_percent must be in [1, 100]")
+        raise ValueError("render_coverage_video(): progress_every_percent must be in [1, 100]")
 
     counts = np.asarray(ao.counts)
     if counts.ndim != 2:
-        raise ValueError("render_coverage_video_mercator(): ao.counts must be 2D")
+        raise ValueError("render_coverage_video(): ao.counts must be 2D")
 
     Nt, Np = counts.shape
     lat_deg = np.asarray(ao.lat_deg, dtype=np.float64)
     lon_deg = np.asarray(ao.lon_deg, dtype=np.float64)
     if lat_deg.shape != (Np,) or lon_deg.shape != (Np,):
-        raise ValueError("render_coverage_video_mercator(): lat/lon lengths must match counts.shape[1]")
+        raise ValueError("render_coverage_video(): lat/lon lengths must match counts.shape[1]")
 
     tmp_dir_obj = None
     if output_path is None:
@@ -304,7 +297,7 @@ def render_coverage_video_mercator(
         if tmp_dir_obj is not None:
             tmp_dir_obj.cleanup()
         raise RuntimeError(
-            "render_coverage_video_mercator(): unable to create MP4 writer. "
+            "render_coverage_video(): unable to create MP4 writer. "
             "Install `imageio-ffmpeg` or system `ffmpeg` to enable MP4 export."
         ) from exc
 
@@ -535,46 +528,15 @@ def _get_attr_any(obj: Any, names: list[str], default: Any = None) -> Any:
 
 
 def _extract_elements(elems0: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Extract (a, e, i, raan, argp, M) arrays from an OrbitalElements-like
-    object, a dict, or a raw (N, 6) array; angles coerced to radians."""
-    if hasattr(elems0, "a_km") and hasattr(elems0, "e"):
-        a_km = np.asarray(getattr(elems0, "a_km"), dtype=np.float64)
-        e = np.asarray(getattr(elems0, "e"), dtype=np.float64)
-        inc = np.asarray(_get_attr_any(elems0, ["i_rad", "i", "inc"]), dtype=np.float64)
-        raan = np.asarray(_get_attr_any(elems0, ["raan_rad", "raan", "Omega"]), dtype=np.float64)
-        argp = np.asarray(_get_attr_any(elems0, ["argp_rad", "argp", "omega"]), dtype=np.float64)
-        M = np.asarray(_get_attr_any(elems0, ["M0_rad", "M0", "M_rad", "M"]), dtype=np.float64)
-        if any(v is None for v in (inc, raan, argp, M)):
-            raise ValueError("plot_initial_orbits(): missing angle arrays in elems0")
-        inc, raan, argp, M = _ensure_radians(inc, raan, argp, M)
-        return a_km.ravel(), e.ravel(), inc.ravel(), raan.ravel(), argp.ravel(), M.ravel()
-
-    if isinstance(elems0, dict):
-        a_km = np.asarray(elems0.get("a_km", elems0.get("a")), dtype=np.float64)
-        e = np.asarray(elems0.get("e", elems0.get("ecc")), dtype=np.float64)
-        inc = np.asarray(elems0.get("i_rad", elems0.get("i", elems0.get("inc"))), dtype=np.float64)
-        raan = np.asarray(elems0.get("raan_rad", elems0.get("raan")), dtype=np.float64)
-        argp = np.asarray(elems0.get("argp_rad", elems0.get("argp")), dtype=np.float64)
-        M = np.asarray(elems0.get("M0_rad", elems0.get("M0", elems0.get("M"))), dtype=np.float64)
-        inc, raan, argp, M = _ensure_radians(inc, raan, argp, M)
-        return a_km.ravel(), e.ravel(), inc.ravel(), raan.ravel(), argp.ravel(), M.ravel()
-
-    arr = np.asarray(elems0, dtype=np.float64)
-    if arr.ndim != 2 or arr.shape[1] < 6:
-        raise ValueError("plot_initial_orbits(): elems0 format not recognized")
-    inc, raan, argp, M = _ensure_radians(arr[:, 2], arr[:, 3], arr[:, 4], arr[:, 5])
-    return arr[:, 0].ravel(), arr[:, 1].ravel(), inc.ravel(), raan.ravel(), argp.ravel(), M.ravel()
-
-
-def _ensure_radians(*angles: np.ndarray) -> tuple[np.ndarray, ...]:
-    """Convert angle arrays to radians when their magnitude suggests degrees."""
-    out: list[np.ndarray] = []
-    for a in angles:
-        x = np.asarray(a, dtype=np.float64)
-        if np.nanmax(np.abs(x)) > (2.0 * np.pi + 0.5):
-            x = np.deg2rad(x)
-        out.append(x)
-    return tuple(out)
+    """Extract (a, e, i, raan, argp, M) arrays (angles in radians) from an OrbitalElements."""
+    return (
+        np.asarray(elems0.a_km, dtype=np.float64).ravel(),
+        np.asarray(elems0.e, dtype=np.float64).ravel(),
+        np.asarray(elems0.i_rad, dtype=np.float64).ravel(),
+        np.asarray(elems0.raan_rad, dtype=np.float64).ravel(),
+        np.asarray(elems0.argp_rad, dtype=np.float64).ravel(),
+        np.asarray(elems0.M0_rad, dtype=np.float64).ravel(),
+    )
 
 
 def _eci_to_ecef_simple(r_eci_km: np.ndarray, *, t_s: float, omega_earth_rad_s: float) -> np.ndarray:
@@ -660,16 +622,6 @@ def _set_equal_3d(ax: Any, *, re_km: float, points: np.ndarray, r_max_km: float 
     ax.set_xlim(center[0] - lim, center[0] + lim)
     ax.set_ylim(center[1] - lim, center[1] + lim)
     ax.set_zlim(center[2] - lim, center[2] + lim)
-
-
-def _mercator_project(*, lat_deg: np.ndarray, lon_deg: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Project lat/lon (deg) to Mercator x/y; latitude clipped to +/-85 deg."""
-    lon = ((np.asarray(lon_deg, dtype=np.float64) + 180.0) % 360.0) - 180.0
-    lat = np.clip(np.asarray(lat_deg, dtype=np.float64), -85.0, 85.0)
-    x = np.deg2rad(lon)
-    lat_rad = np.deg2rad(lat)
-    y = np.log(np.tan((np.pi / 4.0) + (lat_rad / 2.0)))
-    return x, y
 
 
 def _mollweide_project(*, lat_deg: np.ndarray, lon_deg: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

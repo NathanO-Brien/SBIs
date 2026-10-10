@@ -21,10 +21,9 @@ from .analysis_matrix import (
 )
 from .config import SimConfig, CoverageConfig, EarthConstants
 from .coverage_calc import coverage_counts_ecef
-from .elements import OrbitalElements, SatellitePhysical
+from .elements import OrbitalElements
 from .frames import eci_to_ecef
 from ..propagators import get_propagator
-from ..propagators.coe import elements_to_eci_rv_km
 from .shell import Shell
 
 
@@ -69,12 +68,8 @@ def _validate_sim_and_coverage(sim: SimConfig, cov: CoverageConfig) -> None:
         raise ValueError("run_simulation(): cov.min_elev_deg must be finite and in [-90, 90]")
 
 
-def _validate_elements_and_phys(
-    elems0: OrbitalElements,
-    phys: SatellitePhysical,
-    *,
-    use_drag: bool,
-) -> int:
+def _validate_elements(elems0: OrbitalElements) -> int:
+    """Check element arrays are finite and consistent; return the satellite count."""
     a = np.asarray(elems0.a_km, dtype=np.float64).ravel()
     e = np.asarray(elems0.e, dtype=np.float64).ravel()
     i = np.asarray(elems0.i_rad, dtype=np.float64).ravel()
@@ -101,15 +96,6 @@ def _validate_elements_and_phys(
     if np.any(e < 0.0) or np.any(e >= 1.0):
         raise ValueError("run_simulation(): elems0.e must satisfy 0 <= e < 1")
 
-    bc = np.asarray(phys.bc_kg_m2, dtype=np.float64).ravel()
-    if bc.size not in {1, ns}:
-        raise ValueError(
-            "run_simulation(): phys.bc_kg_m2 must be scalar or length Ns "
-            f"(Ns={ns}, got {bc.size})"
-        )
-    _assert_finite(bc, "phys.bc_kg_m2")
-    if use_drag and np.any(bc <= 0.0):
-        raise ValueError("run_simulation(): phys.bc_kg_m2 must be > 0 when drag is enabled")
     return ns
 
 
@@ -199,7 +185,6 @@ def _build_run_metadata(
     cov: CoverageConfig,
     earth: EarthConstants,
     elems0: OrbitalElements,
-    phys: SatellitePhysical,
     layer_specs: Any,
     propagator: str,
     prop_meta: Any,
@@ -226,9 +211,6 @@ def _build_run_metadata(
         "regional": active_stats if summary_scope == "regional" else None,
     }
     sim_meta = _sim_metadata_for_propagator(sim=sim, propagator=propagator)
-    drag_enabled = _drag_enabled_for_propagator(sim=sim, propagator=propagator)
-    layer_specs_meta = layer_specs if drag_enabled else _strip_drag_fields(layer_specs)
-    phys_meta = phys if drag_enabled else _strip_drag_fields(_to_jsonable(phys))
     return {
         "schema_version": "run_meta.v2",
         "run": {
@@ -249,8 +231,7 @@ def _build_run_metadata(
                 "meta": _to_jsonable(shell_meta),
             },
             "elements0": _to_jsonable(elems0),
-            "physical": _to_jsonable(phys_meta),
-            "layer_specs": _to_jsonable(layer_specs_meta),
+            "layer_specs": _to_jsonable(layer_specs),
         },
         "grid": {
             "Nt": int(times_s.size),
@@ -273,48 +254,19 @@ def _build_run_metadata(
 
 
 def _sim_metadata_for_propagator(*, sim: SimConfig, propagator: str) -> dict[str, Any]:
-    """Emit only simulation knobs relevant to the selected propagator."""
-    out: dict[str, Any] = {
+    """Simulation settings recorded in the run metadata."""
+    return {
         "horizon_s": float(sim.horizon_s),
         "dt_s": float(sim.dt_s),
         "point_chunk": int(sim.point_chunk),
         "epoch0": str(sim.epoch0),
-        "analysis_matrix_dtype": str(getattr(sim, "analysis_matrix_dtype", "uint16")),
+        "analysis_matrix_dtype": str(sim.analysis_matrix_dtype),
+        "use_j2": bool(sim.use_j2),
     }
-
-    if propagator in {"Nominal_Propagator", "Kepler_J2_Drag"}:
-        out["use_j2"] = bool(getattr(sim, "use_j2", True))
-        out["use_drag"] = bool(getattr(sim, "use_drag", False))
-        if out["use_drag"]:
-            out["rho0_kg_m3"] = float(getattr(sim, "rho0_kg_m3", 3.614e-13))
-            out["h0_km"] = float(getattr(sim, "h0_km", 700.0))
-            out["H_km"] = float(getattr(sim, "H_km", 88.667))
-            out["rho_scale"] = float(getattr(sim, "rho_scale", 1.0))
-            out["drag_floor_alt_km"] = float(getattr(sim, "drag_floor_alt_km", 120.0))
-
-    # Unknown propagators fall through with generic fields only.
-    return out
-
-
-def _drag_enabled_for_propagator(*, sim: SimConfig, propagator: str) -> bool:
-    """True when the selected propagator will apply atmospheric drag."""
-    if propagator in {"Nominal_Propagator", "Kepler_J2_Drag"}:
-        return bool(getattr(sim, "use_drag", False))
-    return False
-
-
-def _strip_drag_fields(value: Any) -> Any:
-    """Remove drag-only fields from metadata when drag is disabled."""
-    if isinstance(value, dict):
-        return {k: _strip_drag_fields(v) for k, v in value.items() if k != "bc_kg_m2"}
-    if isinstance(value, list):
-        return [_strip_drag_fields(v) for v in value]
-    return value
 
 
 def run_simulation(
     elems0: OrbitalElements,
-    phys: SatellitePhysical,
     sim: SimConfig,
     cov: CoverageConfig,
     earth: EarthConstants,
@@ -322,6 +274,7 @@ def run_simulation(
     layer_specs: Any,
     *,
     propagator: str = "Nominal_Propagator",
+    build_meta: bool = True,
 ) -> Analysis:
     """
     Run a coverage simulation for a constellation over the target shell.
@@ -329,21 +282,21 @@ def run_simulation(
     Parameters
     ----------
     elems0      : vectorized orbital elements at epoch (n_sats per field)
-    phys        : satellite physical properties (ballistic coefficient etc.)
     sim         : simulation timeframe and propagation settings
     cov         : engagement parameters and derived interceptor reach
     earth       : Earth physical constants
     shell       : target shell (points, normals, lat/lon)
     layer_specs : constellation composition description, stored in metadata
     propagator  : registry name of the propagator to use
+    build_meta  : build the provenance metadata dict (hashing/JSON conversion); pass False for the
+                  thousands of per-seed simulations where only ``counts`` is used
 
     Returns
     -------
     Analysis with counts[t, p] = number of satellites covering shell point p
-    at timestep t, plus per-point/per-time means and provenance metadata.
+    at timestep t, plus provenance metadata.
     """
     _assert_isinstance(elems0, OrbitalElements, "elems0")
-    _assert_isinstance(phys, SatellitePhysical, "phys")
     _assert_isinstance(sim, SimConfig, "sim")
     _assert_isinstance(cov, CoverageConfig, "cov")
     _assert_isinstance(earth, EarthConstants, "earth")
@@ -352,8 +305,7 @@ def run_simulation(
     if not isinstance(propagator, str) or not propagator:
         raise TypeError("run_simulation(): propagator must be a non-empty string")
     _validate_sim_and_coverage(sim, cov)
-    use_drag = _drag_enabled_for_propagator(sim=sim, propagator=propagator)
-    ns = _validate_elements_and_phys(elems0, phys, use_drag=use_drag)
+    ns = _validate_elements(elems0)
 
     pts_ecef_km, n_hat_ecef, lat_deg, lon_deg = _validate_and_extract_shell_arrays(shell)
 
@@ -370,18 +322,8 @@ def run_simulation(
         )
 
     # --- Propagator selection + initialization ---
-    # Convert classical elements to ECI position/velocity at epoch (Ns, 3).
-    r0_eci_km, v0_eci_km_s = elements_to_eci_rv_km(elems0, earth)
-
     prop = get_propagator(propagator)
-    state = prop.init_state(
-        elems0=elems0,
-        r0_eci_km=r0_eci_km,
-        v0_eci_km_s=v0_eci_km_s,
-        phys=phys,
-        sim=sim,
-        earth=earth,
-    )
+    state = prop.init_state(elems0=elems0, sim=sim, earth=earth)
 
     # --- Main loop: propagate, rotate to ECEF, evaluate coverage in chunks ---
     for k, t in enumerate(times_s):
@@ -389,9 +331,7 @@ def run_simulation(
 
         r_sat_eci = prop.step_state_to_eci_positions(
             state=state,
-            phys=phys,
             dt_s=dt,
-            t_s=float(t),
             sim=sim,
             earth=earth,
         )
@@ -433,32 +373,14 @@ def run_simulation(
         lat_deg, lon_deg, shell_alt_km=float(getattr(shell, "shell_alt_km", 0.0)), extra=None
     )
 
-    prop_meta = None
-    if hasattr(prop, "get_metadata"):
-        try:
-            prop_meta = prop.get_metadata(state=state, sim=sim, earth=earth, phys=phys)
-        except Exception:
-            prop_meta = {"error": "failed to collect propagator metadata"}
-
-    meta = _build_run_metadata(
-        counts=counts,
-        times_s=times_s,
-        lat_deg=lat_deg,
-        lon_deg=lon_deg,
-        shell=shell,
-        shell_id=shell_id,
-        sim=sim,
-        cov=cov,
-        earth=earth,
-        elems0=elems0,
-        phys=phys,
-        layer_specs=layer_specs,
-        propagator=propagator,
-        prop_meta=prop_meta,
-    )
-
-    point_mean = counts.astype(np.float64, copy=False).mean(axis=0).astype(np.float32)
-    time_mean = counts.astype(np.float64, copy=False).mean(axis=1).astype(np.float32)
+    meta: dict[str, Any] = {}
+    if build_meta:
+        prop_meta = prop.get_metadata(sim=sim) if hasattr(prop, "get_metadata") else None
+        meta = _build_run_metadata(
+            counts=counts, times_s=times_s, lat_deg=lat_deg, lon_deg=lon_deg, shell=shell,
+            shell_id=shell_id, sim=sim, cov=cov, earth=earth, elems0=elems0,
+            layer_specs=layer_specs, propagator=propagator, prop_meta=prop_meta,
+        )
 
     return Analysis(
         counts=counts,
@@ -466,7 +388,5 @@ def run_simulation(
         lat_deg=lat_deg,
         lon_deg=lon_deg,
         meta=meta,
-        point_mean=point_mean,
-        time_mean=time_mean,
         shell_id=shell_id,
     )

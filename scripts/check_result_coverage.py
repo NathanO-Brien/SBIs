@@ -1,116 +1,59 @@
 """
 check_result_coverage.py
 
-Re-simulate a stored SCLP result with the CURRENT code and report whether the
-selected constellation actually covers its targets.
+Re-simulate a stored result with the CURRENT code and report whether the selected constellation
+actually covers its targets.
 
-Given a run (its short name, a path to its _result.csv/_result.json, or a folder
-holding one), this loads the exact orbital elements and simulation settings
-from those files, runs the coverage simulation from scratch, and prints
-per-target coverage statistics against the run's r_required.
+Given a run (its short name, a path to its _result.csv/_result.json, an S3 URI/key, or a folder holding
+one), this loads the exact orbital elements and simulation settings from the run's files, runs the
+coverage simulation from scratch, and prints per-target coverage statistics against the run's r_required.
 
 Usage:
-    python scripts/check_result_coverage.py CNP-s046-d15-v6-g10-b170-k0-i1-261009a-6dff
-    python scripts/check_result_coverage.py results/CNP-...-6dff_result.json --verbose
+    python scripts/check_result_coverage.py CNp-s046-d15-v6-g10-b170-k0-i1-261009a-6dff
+    python scripts/check_result_coverage.py results/CNp-...-6dff_result.json --verbose
     python scripts/check_result_coverage.py <name> --folder some/other/dir
 
 A run name that is not in --folder (default: results) is downloaded from the flat
-s3://sbi-optimization-runs/runs/ prefix into that folder first, so this also checks
-cloud results.
+s3://sbi-optimization-runs/runs/ prefix into that folder first, so this also checks cloud results.
 """
 from __future__ import annotations
 
 import argparse
-import csv
-import json
 import time
-from pathlib import Path
 
 import numpy as np
 
-from sbi_coverage.core.config import EarthConstants, SimConfig, CoverageConfig, coverage_config_from_sidecar
-from sbi_coverage.core.elements import OrbitalElements, SatellitePhysical
-from sbi_coverage.core.shell import Shell
 from sbi_coverage.core.simulate import run_simulation
-from sbi_coverage.runs.index import resolve_run_files
-
-
-def _load_orb_csv(csv_path: Path) -> np.ndarray:
-    """Return (n_sats, 6): a_km | e | i_deg | raan_deg | argp_deg | arg_lat_deg."""
-    rows = []
-    with csv_path.open(newline="") as f:
-        for row in csv.DictReader(f):
-            rows.append([
-                float(row["a_km"]), float(row["e"]), float(row["i_deg"]),
-                float(row["raan_deg"]), float(row["argp_deg"]), float(row["arg_lat_deg"]),
-            ])
-    if not rows:
-        raise ValueError(f"CSV contains no data rows: {csv_path}")
-    return np.array(rows, dtype=np.float64)
+from sbi_coverage.runs.replay import (PROPAGATOR, elements_from_orb, load_run, predefined_shell, replay_configs,
+                                      target_arrays)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Re-simulate a stored SCLP result and check its coverage."
-    )
+    parser = argparse.ArgumentParser(description="Re-simulate a stored result and check its coverage.")
     parser.add_argument("run", help="Run name, path to its _result.csv/.json, S3 URI/key, or a folder containing one")
     parser.add_argument("--folder", default="results", help="Local flat results folder (default: results)")
-    parser.add_argument("--verbose", action="store_true",
-                        help="List every under-covered target individually.")
+    parser.add_argument("--verbose", action="store_true", help="List every under-covered target individually.")
     args = parser.parse_args()
 
-    csv_path, json_path = resolve_run_files(args.run, args.folder)
-    with json_path.open() as f:
-        cfg = json.load(f)
-
-    orb = _load_orb_csv(csv_path)
+    run = load_run(args.run, args.folder)
+    sc, orb = run["sidecar"], run["orb"]
     n_sats = orb.shape[0]
+    r_required = int(sc["run_config"].get("r_required", 1))
 
-    rc = cfg.get("run_config", {})
-    r_required = int(rc.get("r_required", 1))
+    earth, cov, sim = replay_configs(sc)
+    labels, lats, _ = target_arrays(sc)
+    shell = predefined_shell(sc, earth, cov)
 
-    # ------------------------------------------------------------------
-    # Reconstruct configs exactly from the sidecar
-    # ------------------------------------------------------------------
-    earth = EarthConstants()
-    cov = coverage_config_from_sidecar(cfg["cov"], earth)
-    s = cfg["sim"]
-    sim = SimConfig(
-        horizon_s=float(s["horizon_s"]),
-        dt_s=float(s["dt_s"]),
-        use_j2=bool(s.get("use_j2", False)),
-        use_drag=False,
-        analysis_matrix_dtype="uint16",   # avoid uint8 clipping for large constellations
-    )
-
-    elems0 = OrbitalElements(
-        a_km=orb[:, 0], e=orb[:, 1], i_rad=np.deg2rad(orb[:, 2]),
-        raan_rad=np.deg2rad(orb[:, 3]), argp_rad=np.deg2rad(orb[:, 4]),
-        M0_rad=np.deg2rad(orb[:, 5] - orb[:, 4]),
-    )
-    phys = SatellitePhysical(bc_kg_m2=np.full(n_sats, float(cfg.get("bc_kg_m2", 80.0))))
-
-    targets = cfg.get("targets", [])
-    lats = np.array([t["lat_deg"] for t in targets], dtype=np.float64)
-    lons = np.array([t["lon_deg"] for t in targets], dtype=np.float64)
-    labels = [t.get("name", f"Target {i}") for i, t in enumerate(targets)]
-    shell = Shell.from_points(earth, lat_deg=lats, lon_deg=lons, shell_alt_km=cov.intercept_alt_km)
-
-    print(f"Run        : {csv_path.name}")
+    print(f"Run        : {run['csv_path'].name}")
     print(f"Satellites : {n_sats}")
     print(f"Targets    : {len(lats)}   r_required: {r_required}")
-    print(f"Horizon    : {sim.horizon_s/3600} h   dt: {sim.dt_s} s   use_j2: {sim.use_j2}")
-    print(f"Stored     : status={cfg.get('status_str')}  mip_gap={cfg.get('mip_gap')}")
+    print(f"Horizon    : {sim.horizon_s / 3600} h   dt: {sim.dt_s} s   use_j2: {sim.use_j2}")
+    res = sc["result"]
+    print(f"Stored     : status={res.get('status')}  mip_gap={res.get('mip_gap_achieved')}")
 
-    # ------------------------------------------------------------------
-    # Re-simulate with current code
-    # ------------------------------------------------------------------
     t0 = time.perf_counter()
-    ao = run_simulation(
-        elems0, phys, sim, cov, earth, shell,
-        [{"type": "stored-result", "n_total": n_sats}],
-        propagator="Nominal_Propagator",
-    )
+    ao = run_simulation(elements_from_orb(orb), sim, cov, earth, shell, [{"type": "stored-result", "n_total": n_sats}],
+                        propagator=PROPAGATOR)
     print(f"\nRe-simulated in {time.perf_counter() - t0:.2f} s with current code.\n")
 
     counts = ao.counts.astype(np.int32)             # (Nt, Np)
@@ -120,19 +63,16 @@ def main() -> None:
     n_bad = len(lats) - n_ok
 
     print("=" * 60)
-    print(f"  Targets covered at every timestep : {n_ok} / {len(lats)}  "
-          f"({100.0 * n_ok / len(lats):.2f}%)")
+    print(f"  Targets covered at every timestep : {n_ok} / {len(lats)}  ({100.0 * n_ok / len(lats):.2f}%)")
     print(f"  Overall min count                 : {int(counts.min())}")
     print(f"  Overall mean count                : {float(counts.mean()):.2f}")
     print("=" * 60)
 
     if n_bad > 0:
-        # Fraction of timesteps each failing target is under-covered
-        frac_under = (counts < r_required).mean(axis=0)
-        print(f"\n{n_bad} under-covered target(s)"
-              + ("" if args.verbose else "  (pass --verbose to list all)") + ":")
+        frac_under = (counts < r_required).mean(axis=0)   # fraction of steps each target is under-covered
+        print(f"\n{n_bad} under-covered target(s)" + ("" if args.verbose else "  (pass --verbose to list all)") + ":")
         order = np.argsort(min_per_target)
-        shown = order[:len(order)] if args.verbose else order[:10]
+        shown = order if args.verbose else order[:10]
         for idx in shown:
             if always_covered[idx]:
                 continue

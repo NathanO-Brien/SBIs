@@ -1,121 +1,48 @@
 """
 diagnose_coverage_gaps.py
 
-Loads a saved SCLP result CSV, re-runs the coverage simulation, and reports
-the time-step distribution of (j, target) pairs that have zero coverage.
+Loads a stored run, re-runs the coverage simulation, and reports the time-step distribution of the
+(time step, target) pairs that have zero coverage.
 
 This tells us whether coverage gaps are:
-  - Clustered near j=0 or j=L-1  →  V matrix wrap-around error (APC circulant mismatch)
-  - Uniform across time           →  propagator drift or insufficient seed set
+  - clustered near j=0 or j=L-1  ->  circulant (APC) wrap-around mismatch in the constraint matrix
+  - uniform across time          ->  propagator drift or an insufficient seed set
 
 Usage:
-    python scripts/diagnose_coverage_gaps.py
+    python scripts/diagnose_coverage_gaps.py                       # newest result in results/
     python scripts/diagnose_coverage_gaps.py <run name | path to _result.csv | s3://.../runs/<name>_result.csv>
 """
 from __future__ import annotations
 
-import csv
-import json
 import sys
 from pathlib import Path
 
 import numpy as np
 
-from sbi_coverage.core.config import EarthConstants, SimConfig, CoverageConfig, coverage_config_from_sidecar
-from sbi_coverage.core.elements import OrbitalElements, SatellitePhysical
-from sbi_coverage.core.shell import Shell
 from sbi_coverage.core.simulate import run_simulation
-from sbi_coverage.runs.index import resolve_run_files
+from sbi_coverage.runs.replay import PROPAGATOR, elements_from_orb, load_run, predefined_shell, replay_configs
 
-# ---------------------------------------------------------------------------
-# Config — point to the result you want to diagnose
-# ---------------------------------------------------------------------------
-RESULT: str | None = None   # run name, local _result.csv path, or S3 URI/key; CLI argument overrides
+# Run name, local _result.csv path, or S3 URI/key; None = newest result. A command-line argument overrides it.
+RESULT: str | None = None
 RESULTS_DIR = Path(__file__).resolve().parents[1] / "results"
 
 N_ZERO_PAIRS_TO_PRINT = 20   # how many specific uncovered (j, target_idx) to show
 
 
-# ---------------------------------------------------------------------------
-def _resolve_csv(arg: str | None) -> Path:
-    csv_path, _ = resolve_run_files(sys.argv[1] if len(sys.argv) > 1 else arg, RESULTS_DIR)
-    return csv_path
-
-
-def _load_orb_csv(csv_path: Path) -> np.ndarray:
-    rows = []
-    with csv_path.open(newline="") as f:
-        for row in csv.DictReader(f):
-            rows.append([
-                float(row["a_km"]),
-                float(row["e"]),
-                float(row["i_deg"]),
-                float(row["raan_deg"]),
-                float(row["argp_deg"]),
-                float(row["arg_lat_deg"]),
-            ])
-    return np.array(rows, dtype=np.float64)
-
-
 def main() -> None:
-    csv_path  = _resolve_csv(RESULT)
-    json_path = csv_path.with_suffix(".json")
-    if not json_path.exists():
-        raise FileNotFoundError(f"JSON sidecar not found: {json_path}")
+    run = load_run(sys.argv[1] if len(sys.argv) > 1 else RESULT, RESULTS_DIR)
+    sc, orb = run["sidecar"], run["orb"]
+    n_sats = orb.shape[0]
+    print(f"Loaded {n_sats} satellites from {run['csv_path'].name}")
+    print(f"  MIP gap at save time: {(sc['result'].get('mip_gap_achieved') or 0.0) * 100:.4f}%")
 
-    with json_path.open() as f:
-        cfg = json.load(f)
-
-    orb_arr = _load_orb_csv(csv_path)
-    n_sats  = orb_arr.shape[0]
-    print(f"Loaded {n_sats} satellites from {csv_path.name}")
-    print(f"  MIP gap at save time: {(cfg.get('mip_gap') or 0.0)*100:.4f}%")
-
-    earth = EarthConstants()
-
-    cov = coverage_config_from_sidecar(cfg["cov"], earth)
-
-    s = cfg["sim"]
-    sim = SimConfig(
-        horizon_s=                float(s["horizon_s"]),
-        dt_s=                     float(s["dt_s"]),
-        analysis_matrix_dtype=    str(s.get("analysis_matrix_dtype", "uint8")),
-        use_j2=                   bool(s.get("use_j2", False)),
-        use_drag=                 bool(s.get("use_drag", False)),
-    )
-
-    # Reconstruct target shell from JSON sidecar
-    targets = cfg.get("targets", [])
-    lats   = np.array([t["lat_deg"] for t in targets], dtype=np.float64)
-    lons   = np.array([t["lon_deg"] for t in targets], dtype=np.float64)
-    labels = [t.get("name", f"Target {i}") for i, t in enumerate(targets)]
-    shell  = Shell.from_points(
-        earth,
-        lat_deg=lats,
-        lon_deg=lons,
-        shell_alt_km=cov.intercept_alt_km,
-        meta_extra={"labels": labels},
-    )
-
-    # Reconstruct orbital elements (arg_lat = argp + M => M = arg_lat - argp)
-    elems = OrbitalElements(
-        a_km     = orb_arr[:, 0],
-        e        = orb_arr[:, 1],
-        i_rad    = np.deg2rad(orb_arr[:, 2]),
-        raan_rad = np.deg2rad(orb_arr[:, 3]),
-        argp_rad = np.deg2rad(orb_arr[:, 4]),
-        M0_rad   = np.deg2rad(orb_arr[:, 5] - orb_arr[:, 4]),
-    )
-    phys = SatellitePhysical(bc_kg_m2=np.full(n_sats, float(cfg.get("bc_kg_m2", 80.0))))
-
+    earth, cov, sim = replay_configs(sc)
+    shell = predefined_shell(sc, earth, cov)
+    elems = elements_from_orb(orb)
     layer_specs = {"type": "SCLP-selected (RGT)", "n_satellites": n_sats}
 
     print(f"\nRunning coverage simulation ({n_sats} sats, horizon={sim.horizon_s/3600:.2f} h, dt={sim.dt_s:.6f} s) ...")
-    analysis = run_simulation(
-        elems0=elems, phys=phys, sim=sim, cov=cov, earth=earth,
-        shell=shell, layer_specs=layer_specs,
-        propagator="Nominal_Propagator",
-    )
+    analysis = run_simulation(elems, sim, cov, earth, shell, layer_specs, propagator=PROPAGATOR)
 
     # analysis.counts shape: (Nt, n_targets)
     counts = np.asarray(analysis.counts)

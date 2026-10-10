@@ -7,7 +7,8 @@ Implements the Spatial-temporal Coverage Location Problem from:
   doi: 10.2514/1.A36518
 
 Replicates the MILPCollection.SCLP() formulation and Gurobi tuning from
-MILPCollection.m, including the RGT symmetry-breaking constraint.
+MILPCollection.m. The single-block RGT symmetry-breaking constraint (pin x[0]=1) is available but off
+by default, because the seed-family pool is several circulant blocks.
 
 Interrupt behaviour: pressing Ctrl+C during solve_sclp() stops Gurobi and
 returns the best incumbent found so far, exactly as in the MATLAB workflow.
@@ -19,7 +20,7 @@ import json
 import math
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -33,7 +34,7 @@ try:
 except ImportError:
     _GUROBI_AVAILABLE = False
 
-from ..constellations.layer import Layer
+from .layer import Layer
 
 if TYPE_CHECKING:
     from ..core.config import CoverageConfig, SimConfig
@@ -175,6 +176,7 @@ class SCLPResult:
     time_optimization_s: float   # solver wall-clock time (s)
     x_binary: np.ndarray         # full binary solution vector, shape (nOrbitalSlots,)
     n_satellites: int            # number of selected satellites
+    node_count: int = 0          # branch-and-bound nodes explored
 
 
 _GUROBI_STATUS_STRINGS = {
@@ -197,8 +199,8 @@ _GUROBI_STATUS_STRINGS = {
     17: "Memory limit",
 }
 
-# Gurobi statuses that may still carry a valid incumbent solution
-_INCUMBENT_STATUSES = {2, 9, 10, 11, 13, 15}  # Optimal, TimeLimit, SolLimit, Interrupted, Suboptimal, ObjLimit
+#: Gurobi parameters this module always sets (before caller overrides); recorded in every result JSON.
+GUROBI_FIXED_PARAMS = {"CoverCuts": 2, "Cuts": 2, "Symmetry": 2, "LPWarmStart": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +212,6 @@ def solve_sclp(
     param_r: np.ndarray,
     *,
     param_c: np.ndarray | None = None,
-    n_targets: int = 1,
     apply_rgt_symmetry_break: bool = False,
     mip_gap: float = 0.0,
     time_limit_s: float = float("inf"),
@@ -233,8 +234,6 @@ def solve_sclp(
         satellites that must simultaneously see target j at time t.
     param_c : (nOrbitalSlots,) float64, optional
         Cost vector.  Defaults to all-ones (objective = satellite count).
-    n_targets : int
-        Number of targets (used to infer L from param_V shape).
     apply_rgt_symmetry_break : bool
         If True, apply the single-block RGT symmetry-breaking constraint
         (pin x[0] = 1). This is appropriate only when the candidate pool
@@ -305,13 +304,14 @@ def solve_sclp(
         )
 
     n_rows, n_orb_slots = param_V.shape
-    L = n_rows // n_targets
 
     # Flatten param_r to match param_V row ordering.
     # param_V rows are indexed j*L + t (target-major).
     # param_r shape is (L, n_targets); Fortran-order flatten gives
     # [target-0 block, target-1 block, ...] which matches.
     param_r = np.asarray(param_r, dtype=np.float64)
+    if param_r.size != n_rows:
+        raise ValueError(f"param_r has {param_r.size} entries but param_V has {n_rows} rows")
     param_r_flat = param_r.flatten(order="F")
 
     if param_c is None:
@@ -325,6 +325,7 @@ def solve_sclp(
     t0 = time.perf_counter()
 
     import os as _os
+    _env = None
     _wls_access = _os.environ.get("GRB_WLSACCESSID", "").strip()
     _wls_secret = _os.environ.get("GRB_WLSSECRET", "").strip()
     _wls_licid  = _os.environ.get("GRB_LICENSEID", "").strip()
@@ -351,10 +352,10 @@ def solve_sclp(
     # Gurobi tuning
     m.Params.MIPFocus    = int(mip_focus)      # 1=find incumbents fast, 2=close gap
     m.Params.Heuristics  = float(heuristics_frac)
-    m.Params.CoverCuts   = 2  # aggressive cover cuts for set-covering structure
-    m.Params.Cuts        = 2  # all cut families aggressively
-    m.Params.Symmetry    = 2  # internal symmetry detection
-    m.Params.LPWarmStart = 1
+    # GUROBI_FIXED_PARAMS: aggressive cover cuts / cuts for the set-covering structure, internal
+    # symmetry detection, LP warm start. Recorded in the result JSON.
+    for _pname, _pval in GUROBI_FIXED_PARAMS.items():
+        m.setParam(_pname, _pval)
     m.Params.MIPGap      = mip_gap
 
     if time_limit_s < float("inf"):
@@ -389,7 +390,8 @@ def solve_sclp(
         m.addConstr(x[0] == 1, name="sym_break")
 
     t_model = time.perf_counter() - t0
-    print("SCLP modeling done")
+    if verbose:
+        print("SCLP modeling done")
 
     # ------------------------------------------------------------------
     # Solve — Ctrl+C stops Gurobi and returns best incumbent
@@ -406,61 +408,61 @@ def solve_sclp(
 
     status_str = _GUROBI_STATUS_STRINGS.get(m.Status, f"Unknown ({m.Status})")
 
-    if m.Status in _INCUMBENT_STATUSES and m.SolCount > 0:
-        x_sol = x.X
-        selected = np.where(x_sol > 0.5)[0]
-        return SCLPResult(
-            selected_slots=selected,
-            obj_val=float(m.ObjVal),
-            obj_bound=float(m.ObjBound),
-            mip_gap=float(m.MIPGap),
-            status=int(m.Status),
-            status_str=status_str,
-            time_modeling_s=t_model,
-            time_optimization_s=t_solve,
-            x_binary=x_sol,
-            n_satellites=int(selected.size),
-        )
-    else:
+    try:
+        if m.SolCount > 0:
+            x_sol = x.X
+            selected = np.where(x_sol > 0.5)[0]
+            return SCLPResult(
+                selected_slots=selected,
+                obj_val=float(m.ObjVal),
+                obj_bound=float(m.ObjBound),
+                mip_gap=float(m.MIPGap),
+                status=int(m.Status),
+                status_str=status_str,
+                time_modeling_s=t_model,
+                time_optimization_s=t_solve,
+                x_binary=x_sol,
+                n_satellites=int(selected.size),
+                node_count=int(m.NodeCount),
+            )
         raise RuntimeError(
             f"SCLP returned no feasible solution.  "
             f"Gurobi status: {status_str}.  "
             f"Check coverage requirements or engagement parameters."
         )
+    finally:
+        # Release the model and (cloud) WLS session so repeated solves in one process do not leak seats.
+        m.dispose()
+        if _env is not None:
+            _env.dispose()
 
 
 # ---------------------------------------------------------------------------
 # Post-processing helpers
 # ---------------------------------------------------------------------------
 
-def build_orb_elems_table(sub_layers: list[Layer], L: int, n_cols_per_seed: list[int] | None = None) -> np.ndarray:
-    """Build the orbital elements table for all orbital slots.
+def build_orb_elems_table(seed_layers: list[Layer], cols_per_seed: list[int]) -> np.ndarray:
+    """Build the orbital elements table for all candidate slots (the columns of param_V).
 
     Parameters
     ----------
-    sub_layers : list of Layer
-        One Layer per sub-constellation (inclination), each containing L slots.
-    L : int
-        Number of orbital slots per sub-constellation (= number of time steps).
-    n_cols_per_seed : list of int, optional
-        Slots kept per sub-constellation (must match build_param_V); default L each.
+    seed_layers : list of Layer
+        One Layer (L slots) per kept seed.
+    cols_per_seed : list of int
+        Slots kept per seed (must match build_param_V); a reducible family keeps only L // g.
 
     Returns
     -------
     orb_elems : (nOrbitalSlots, 6) float64
-        Columns: a_km | e | i_deg | raan_deg | argp_deg | arg_lat_deg
-        Rows correspond to columns of param_V:
-        sub-constellation 0 slots 0..L-1, then sub-constellation 1, etc.
-        arg_lat_deg = argp_deg + M0_deg  (equals M0_deg for circular orbits).
+        Columns: a_km | e | i_deg | raan_deg | argp_deg | arg_lat_deg, where arg_lat_deg = argp + M0
+        (= M0 for circular orbits). Row r is column r of param_V: seed 0 slots 0.., then seed 1, etc.
     """
-    if n_cols_per_seed is None:
-        n_cols_per_seed = [L] * len(sub_layers)
-    n_orb_slots = int(sum(n_cols_per_seed))
+    n_orb_slots = int(sum(cols_per_seed))
     orb_elems = np.zeros((n_orb_slots, 6), dtype=np.float64)
     start = 0
-    for s, layer in enumerate(sub_layers):
+    for s, layer in enumerate(seed_layers):
         e = layer.elems
-        m = int(n_cols_per_seed[s])
+        m = int(cols_per_seed[s])
         sl = slice(0, m)
         orb_elems[start:start + m, 0] = np.asarray(e.a_km,     dtype=np.float64)[sl]
         orb_elems[start:start + m, 1] = np.asarray(e.e,        dtype=np.float64)[sl]
@@ -493,12 +495,9 @@ def save_orb_table_csv(
     orb_elems: np.ndarray,
     selected_slots: np.ndarray,
     output_path: str | Path,
+    extra_columns: dict[str, list] | None = None,
 ) -> None:
-    """Save the orbital characteristics table for selected slots to CSV.
-
-    Mirrors the MATLAB table() output from mainIllustrativeExamples.m, with
-    an additional slot_index column and eccentricity / argp columns for
-    completeness.
+    """Save the orbital characteristics table for the selected slots to CSV.
 
     Parameters
     ----------
@@ -507,16 +506,21 @@ def save_orb_table_csv(
     selected_slots : (n_selected,) int
         0-indexed slot indices from SCLPResult.selected_slots.
     output_path : str or Path
-        Destination CSV file.  Parent directory is created as needed.
+        Destination CSV file. Parent directory is created as needed.
+    extra_columns : dict, optional
+        Name -> per-slot values for ALL slots (length nOrbitalSlots); the selected rows are written
+        after ``slot_index`` (e.g. ``seed_index``, ``family``, ``seed_raan_deg``).
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     selected_elems = orb_elems[selected_slots]
+    extra_columns = extra_columns or {}
     with output_path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(_ORB_COLS)
+        writer.writerow([_ORB_COLS[0], *extra_columns.keys(), *_ORB_COLS[1:]])
         for idx, row in zip(selected_slots, selected_elems):
-            writer.writerow([int(idx)] + [f"{v:.6f}" for v in row])
+            writer.writerow([int(idx)] + [extra_columns[k][int(idx)] for k in extra_columns]
+                            + [f"{v:.6f}" for v in row])
     print(f"Saved orbital table ({len(selected_slots)} satellites): {output_path}")
 
 
@@ -533,6 +537,9 @@ def print_orb_table(orb_elems: np.ndarray, selected_slots: np.ndarray) -> None:
         print(f"{row[0]:12.2f}  {row[2]:10.4f}  {row[3]:10.4f}  {row[5]:13.4f}")
 
 
+SCHEMA_VERSION = 2
+
+
 def save_sclp_result(
     result: SCLPResult,
     orb_elems: np.ndarray,
@@ -542,72 +549,82 @@ def save_sclp_result(
     sim: SimConfig,
     targets: list[dict[str, Any]],
     countries: list[str],
-    propagator: str = "Nominal_Propagator",
-    bc_kg_m2: float = 80.0,
+    run_name: str | None = None,
     run_config: dict[str, Any] | None = None,
-) -> None:
-    """Save an SCLP result to a CSV orbital table and a JSON config sidecar.
+    provenance: dict[str, Any] | None = None,
+    extra_columns: dict[str, list] | None = None,
+) -> Path:
+    """Save an SCLP result as ``<stem>.csv`` (selected satellites) and ``<stem>.json`` (sidecar).
 
-    The two output files share the same stem:
-        <csv_path>          — orbital elements of selected satellites (readable table)
-        <csv_path>.json     — full simulation config for coverage replay
+    The JSON sidecar (schema_version 2) is everything the replay/analysis scripts need to
+    reconstruct CoverageConfig, SimConfig and the target points without manual re-entry:
 
-    The JSON is read by coverage_from_sclp.py to reconstruct CoverageConfig,
-    SimConfig, target points, and physical parameters without any manual
-    re-entry.
+        schema_version, run_name, timestamp_utc
+        result      : n_satellites, status, obj_val, obj_bound, mip_gap_achieved, timings, node_count
+        cov / sim   : CoverageConfig / SimConfig fields
+        targets     : [{name, lat_deg, lon_deg}, ...];  countries: country names (country mode only)
+        run_config  : inputs and derived quantities of the run (see Lee.run_pipeline.build_run_config)
+        provenance  : code/library versions and the machine the run executed on
 
-    Parameters
-    ----------
-    result      : SCLPResult from solve_sclp()
-    orb_elems   : (nOrbitalSlots, 6) array from build_orb_elems_table()
-    csv_path    : destination path for the orbital CSV (e.g. results/sclp_result_<ts>.csv)
-    cov         : CoverageConfig used during the SCLP run
-    sim         : SimConfig used during the SCLP run
-    targets     : list of {"name": str, "lat_deg": float, "lon_deg": float} dicts
-    countries   : list of country names used for downstream regional reporting/rendering
-    propagator  : propagator name string
-    bc_kg_m2    : ballistic coefficient for all selected satellites (kg/m²)
-    run_config  : optional dict of all script-level constants and derived quantities;
-                  stored verbatim under "run_config" in the JSON sidecar so that
-                  every result file is fully self-describing.
+    Returns the JSON path.
     """
     csv_path = Path(csv_path)
-    save_orb_table_csv(orb_elems, result.selected_slots, csv_path)
+    save_orb_table_csv(orb_elems, result.selected_slots, csv_path, extra_columns)
 
     payload: dict[str, Any] = {
-        "version": 1,
-        "timestamp": datetime.now().isoformat(),
-        "n_satellites": result.n_satellites,
-        "obj_val": _finite_or_none(result.obj_val),
-        "mip_gap": _finite_or_none(result.mip_gap),
-        "status_str": result.status_str,
-        "propagator": propagator,
-        "bc_kg_m2": float(bc_kg_m2),
+        "schema_version": SCHEMA_VERSION,
+        "run_name": run_name,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "result": {
+            "n_satellites": int(result.n_satellites),
+            "status": result.status_str,
+            "obj_val": _finite_or_none(result.obj_val),
+            "obj_bound": _finite_or_none(result.obj_bound),
+            "mip_gap_achieved": _finite_or_none(result.mip_gap),
+            "node_count": int(result.node_count),
+            "time_modeling_s": float(result.time_modeling_s),
+            "time_optimization_s": float(result.time_optimization_s),
+        },
         "cov": {
             "detection_time_s":               float(cov.detection_time_s),
             "decision_time_s":                float(cov.decision_time_s),
             "target_missile_burnout_time_s":  float(cov.target_missile_burnout_time_s),
             "interceptor_engagement_time_s":  float(cov.interceptor_engagement_time_s),
-            "v_bo_km_s":        float(cov.v_bo_km_s),
-            "a_g":              float(cov.a_g),
-            "intercept_alt_km": float(cov.intercept_alt_km),
-            "min_elev_deg":     float(cov.min_elev_deg),
+            "burnout_velocity_km_s":          float(cov.burnout_velocity_km_s),
+            "max_accel_g":                    float(cov.max_accel_g),
+            "intercept_alt_km":               float(cov.intercept_alt_km),
+            "min_elev_deg":                   float(cov.min_elev_deg),
+            "max_range_km":                   float(cov.max_range_km),
         },
         "sim": {
             "horizon_s":             float(sim.horizon_s),
             "dt_s":                  float(sim.dt_s),
             "use_j2":                bool(sim.use_j2),
-            "use_drag":              bool(sim.use_drag),
             "analysis_matrix_dtype": str(sim.analysis_matrix_dtype),
         },
         "targets":    targets,
         "countries":  [str(country) for country in countries],
+        "run_config": run_config if run_config is not None else {},
+        "provenance": provenance if provenance is not None else {},
     }
-
-    if run_config is not None:
-        payload["run_config"] = run_config
 
     json_path = csv_path.with_suffix(".json")
     with json_path.open("w") as f:
-        json.dump(payload, f, indent=2)
+        json.dump(_json_safe(payload), f, indent=2, allow_nan=False)
     print(f"Saved config sidecar: {json_path}")
+    return json_path
+
+
+def _json_safe(obj: Any) -> Any:
+    """Recursively convert numpy scalars/arrays and non-finite floats into strict-JSON values."""
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return _json_safe(obj.tolist())
+    if isinstance(obj, np.generic):
+        return _json_safe(obj.item())
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj

@@ -1,15 +1,13 @@
-"""RGT orbital slot construction: common-ground-track layers, J2-adjusted
-semi-major axis, and seed satellite layers.
+"""Repeat-ground-track slot construction under Lee (2020) secular J2: closure solve for the
+semi-major axis, and the L time-shifted orbital slots of one seed (common ground track).
 """
 from __future__ import annotations
-
-from math import gcd
 
 import numpy as np
 
 from ..core.config import EarthConstants
-from ..core.elements import OrbitalElements, SatellitePhysical
-from ..constellations.layer import Layer
+from ..core.elements import OrbitalElements
+from .layer import Layer
 from ..propagators.nominal_propagator import (
     j2_secular_rates_rad_s,
     lee_mean_anomaly_rate_rad_s,
@@ -30,6 +28,21 @@ def lee_j2_rates(a_km: float, inc_deg: float, earth: EarthConstants, e: float = 
     Omegadot, omegadot = j2_secular_rates_rad_s(a, e, i_rad, earth)
     Mdot = lee_mean_anomaly_rate_rad_s(a, e, i_rad, earth)
     return float(Omegadot), float(omegadot), float(Mdot)
+
+
+def inclination_for_omega_dot(a_km: float, omega_dot_star: float, earth: EarthConstants) -> float:
+    """Inclination (deg) of a circular orbit at ``a_km`` whose secular RAAN rate equals ``omega_dot_star``.
+
+    Omega_dot = -k n cos(i) with k n = 1.5 J2 (Re/a)^2 n, so cos(i) = -Omega_dot*/(k n). Returns NaN when
+    no real prograde inclination exists (cos i <= 0 or > 1). Two orbits with equal Omega_dot share the
+    repeat period T_r = N_D 2 pi / (w_E - Omega_dot) exactly (Lee 2020 Eq. 33).
+    """
+    n = np.sqrt(earth.mu_km3_s2 / a_km ** 3)
+    kn = 1.5 * earth.j2 * (earth.r_eq_km / a_km) ** 2 * n
+    cos_i = -omega_dot_star / kn
+    if not (0.0 < cos_i <= 1.0):
+        return float("nan")
+    return float(np.rad2deg(np.arccos(cos_i)))
 
 
 def rgt_closure_residual(a_km: float, N_P: int, N_D: int, inc_deg: float, earth: EarthConstants) -> float:
@@ -88,115 +101,70 @@ def rgt_common_ground_track_layer(
     L: int,
     earth: EarthConstants,
     *,
+    a_km: float,
+    dt_s: float,
     raan0_deg: float = 0.0,
     m0_deg: float = 0.0,
-    bc_kg_m2: float = 80.0,
-    use_j2: bool = True,
-    a_km_override: float | None = None,
-    dt_s: float | None = None,
 ) -> Layer:
-    """Build the L orbital slots of one RGT common-ground-track sub-constellation.
+    """Build the L orbital slots of one seed (a common-ground-track block).
 
-    For the APC decomposition (Lee et al. 2020), all L satellites in a sub-constellation
-    share a single repeating ground track.  Slot k arrives at each ground track point
-    exactly k·Δt later than slot 0 (the seed satellite).  This time offset maps to:
+    For the APC decomposition (Lee et al. 2020), all L satellites of a seed share a single
+    repeating ground track. Slot k arrives at each ground-track point exactly k*dt_s later than
+    slot 0 (the seed satellite). That time offset maps to:
 
-        RAAN_k  = RAAN_0 + k · (ω_E − Ω̇) · dt
-        M₀_k    = M₀_0  − k · (Ṁ + ω̇) · dt
+        RAAN_k  = RAAN_0 + k * (w_E - Omega_dot) * dt_s
+        M0_k    = M0_0  - k * (M_dot + omega_dot) * dt_s
 
-    where dt = T_r / L, Ω̇ / ω̇ are the J2 secular RAAN / argument-of-perigee rates and
-    Ṁ is Lee's J2-corrected mean-anomaly rate (Eq. 5; plain mean motion when
-    use_j2=False).  With J2 on, T_r = N_D · 2π / (ω_E − Ω̇); with J2 off,
-    T_r = N_D · T_sidereal.
+    where Omega_dot / omega_dot are the secular-J2 RAAN / argument-of-perigee rates and M_dot is
+    Lee's J2-corrected mean-anomaly rate (Eq. 5), all evaluated at (a_km, inc_deg). Because the
+    rates use this seed's own inclination, the circulant V[j,k] = v0[(j-k) mod L] is exact for every
+    family of a shared-T_r ladder (Lee Eq. 37 is the special case where this orbit is the reference).
 
-    NOTE on sign: Earth rotates eastward, so a ground-track point's inertial
-    longitude increases with time; the ECEF longitude of the ascending node is
-    RAAN − ω_E·t (frames.py convention, verified in scripts/verify_frames.py).
-    A slot arriving k·Δt LATER at the same ECEF node therefore needs its RAAN
-    shifted EAST by (ω_E − Ω̇)·k·Δt — the + sign in the RAAN formula.  With J2,
-    RAAN drifts at Ω̇ (negative for prograde), giving ECEF node rate Ω̇ − ω_E.
-    All corrections are zeroed when use_j2=False to match a propagator running
-    without J2.
+    Sign convention: Earth rotates eastward, so the ECEF longitude of the ascending node is
+    RAAN - w_E*t (core/frames.py). A slot arriving k*dt_s LATER at the same ECEF node therefore
+    needs its RAAN shifted EAST by (w_E - Omega_dot)*k*dt_s (the + sign above).
 
-    NOTE: This is NOT the same as rgt_layer(n_planes=1), which places all L satellites
-    in a single orbital plane (RAAN identical for all slots).  Equal-RAAN slots do NOT
-    share a common ground track and do NOT produce circulant access profiles.
+    NOT the same as placing L satellites in one orbital plane: equal-RAAN slots do not share a
+    ground track and do not give circulant access profiles.
 
     Parameters
     ----------
-    inc_deg    : inclination (degrees)
-    N_P        : repeat orbits  (numerator of the RGT ratio)
-    N_D        : repeat days    (denominator of the RGT ratio); the ratio need not be in
-                 lowest terms (45:3 is a valid rung of a 3-day grid: its track
-                 repeats every T_r/3, so slots k and k + L/3 coincide)
-    L          : number of orbital slots = number of time steps in T_r
-                 (= round(T_r / dt_s); must match the simulation time axis)
+    inc_deg    : inclination, degrees
+    N_P, N_D   : repeat orbits / repeat days of this seed's ratio; need not be in lowest terms
+                 (45:3 is a valid rung of a 3-day grid: its track repeats every T_r/3, so slots
+                 k and k + L/3 coincide)
+    L          : number of slots = number of time steps in the shared repeat period T_r
     earth      : EarthConstants
+    a_km       : semi-major axis of this seed (from the shared-T_r ladder), km
+    dt_s       : shared simulation time step T_r / L, seconds
     raan0_deg  : RAAN of the seed satellite (slot 0) at epoch, degrees
     m0_deg     : mean anomaly of the seed satellite (slot 0) at epoch, degrees
-    bc_kg_m2   : ballistic coefficient for all slots (drag model, kg/m²)
 
     Returns
     -------
-    Layer with L satellites.  Slot 0 (index 0) is the seed satellite used to
-    compute v_0.  The full layer is used to recover orbital elements of BILP-
-    selected slots after solving.
+    Layer with L slots. Slot 0 is the seed satellite that is simulated to obtain v0; the full
+    layer is used to recover orbital elements of the slots the MILP selects.
     """
     if L <= 0:
         raise ValueError("L must be > 0")
 
-    i_rad = np.deg2rad(inc_deg)
-
-    if use_j2:
-        # a_km_override: seed families (Lee/seed_families.py) pass the exact
-        # (a, i) pair solved for a shared T_r.  Otherwise solve closure at this
-        # inclination (single-family use).
-        if a_km_override is not None:
-            a_km = float(a_km_override)
-        else:
-            a_km = a_km_j2_rgt(N_P, N_D, inc_deg, earth)
-        Omegadot, omegadot, Mdot = lee_j2_rates(a_km, inc_deg, earth)
-        n_kep    = Mdot          # along-track mean-anomaly rate incl. Lee's J2 term
-        T_r      = N_D * 2.0 * np.pi / (earth.omega_earth_rad_s - Omegadot)
-    else:
-        a_km     = _a_km_from_np_nd(N_P, N_D, earth)
-        n_kep    = np.sqrt(earth.mu_km3_s2 / a_km**3)
-        Omegadot = 0.0
-        omegadot = 0.0
-        T_r      = N_D * (2.0 * np.pi / earth.omega_earth_rad_s)
+    Omegadot, omegadot, M_dot = lee_j2_rates(a_km, inc_deg, earth)
+    T_r = N_D * 2.0 * np.pi / (earth.omega_earth_rad_s - Omegadot)
 
     k = np.arange(L, dtype=np.float64)
-
-    # Slot spacing — pre-simplified form of Lee (2020) Eq. 37.
-    # Slot k must be exactly one simulation time-step (dt_slot) behind slot k-1
-    # in both ECEF longitude and argument of latitude:
-    #
-    #   RAAN_k = RAAN_0 + k · (ω_E − Ω̇_inc) · dt_slot
-    #   M_k    = M_0    − k · (n_kep + ω̇_inc) · dt_slot
-    #
-    # dt_slot is the shared simulation dt (T_r_ref / L).  Using the inclination-
-    # specific secular rates (Ω̇_inc, ω̇_inc) ensures the circulant V[j,k] = v0[(j-k) mod L]
-    # is correct for ALL inclinations, not only the reference one.  Lee Eq. 37
-    # (2π·N_D/L, 2π·N_P/L) is the special case where this orbit IS the reference
-    # inclination and T_r_ref equals this orbit's own T_r.
-    _dt_slot = dt_s if dt_s is not None else T_r / L
-
-    raan_rad = np.deg2rad(raan0_deg) + k * (earth.omega_earth_rad_s - Omegadot) * _dt_slot
-    raan_rad = raan_rad % (2.0 * np.pi)
-
-    m0_rad = np.deg2rad(m0_deg) - k * (n_kep + omegadot) * _dt_slot
-    m0_rad = m0_rad % (2.0 * np.pi)
+    raan_rad = (np.deg2rad(raan0_deg) + k * (earth.omega_earth_rad_s - Omegadot) * dt_s) % (2.0 * np.pi)
+    m0_rad = (np.deg2rad(m0_deg) - k * (M_dot + omegadot) * dt_s) % (2.0 * np.pi)
 
     elems = OrbitalElements(
-        a_km    = np.full(L, a_km,  dtype=np.float64),
-        e       = np.zeros(L,       dtype=np.float64),
-        i_rad   = np.full(L, np.deg2rad(inc_deg), dtype=np.float64),
-        raan_rad= raan_rad,
-        argp_rad= np.zeros(L,       dtype=np.float64),
-        M0_rad  = m0_rad,
+        a_km=np.full(L, a_km, dtype=np.float64),
+        e=np.zeros(L, dtype=np.float64),
+        i_rad=np.full(L, np.deg2rad(inc_deg), dtype=np.float64),
+        raan_rad=raan_rad,
+        argp_rad=np.zeros(L, dtype=np.float64),
+        M0_rad=m0_rad,
     )
-    phys = SatellitePhysical(bc_kg_m2=np.full(L, float(bc_kg_m2), dtype=np.float64))
 
+    # Record-only metadata (written into the result JSON's family records; nothing reads it back).
     spec: dict = {
         "type":            "rgt_common_ground_track",
         "inc_deg":         float(inc_deg),
@@ -204,100 +172,30 @@ def rgt_common_ground_track_layer(
         "N_D":             int(N_D),
         "L":               int(L),
         "a_km":            float(a_km),
-        "constellation_alt_km": float(a_km - earth.r_eq_km),
         "T_r_s":           float(T_r),
-        "T_S_s":           float(T_r / N_P),
         "raan0_deg":       float(raan0_deg),
         "m0_deg":          float(m0_deg),
-        "bc_kg_m2":        float(bc_kg_m2),
-        "dt_s_implied":    float(T_r / L),
-        "use_j2":          bool(use_j2),
         "Omegadot_rad_s":  float(Omegadot),
         "omegadot_rad_s":  float(omegadot),
-        "Mdot_rad_s":      float(n_kep),
-        "closure_residual_rad_s": (
-            float(N_P * (earth.omega_earth_rad_s - Omegadot) - N_D * (omegadot + n_kep))
-            if use_j2 else 0.0
-        ),
+        "Mdot_rad_s":      float(M_dot),
+        "closure_residual_rad_s": float(N_P * (earth.omega_earth_rad_s - Omegadot) - N_D * (omegadot + M_dot)),
     }
-
-    return Layer(elems=elems, phys=phys, spec=spec)
+    return Layer(elems=elems, spec=spec)
 
 
 def seed_layer(layer: Layer) -> Layer:
     """Return a single-satellite Layer containing only slot 0 of a common-ground-track layer.
 
-    Use this to run the seed simulation that produces v_0 — simulating all L slots is
-    unnecessary because the APC circulant property derives all other columns analytically.
+    Used to simulate v0: only the seed satellite is propagated, since the circulant property
+    gives every other column analytically.
     """
     e = layer.elems
-    s = layer.phys
 
     def _first(arr: np.ndarray) -> np.ndarray:
-        """Return the first element as a length-1 float64 array."""
         return np.asarray(arr, dtype=np.float64)[[0]]
 
     seed_elems = OrbitalElements(
-        a_km    = _first(e.a_km),
-        e       = _first(e.e),
-        i_rad   = _first(e.i_rad),
-        raan_rad= _first(e.raan_rad),
-        argp_rad= _first(e.argp_rad),
-        M0_rad  = _first(e.M0_rad),
+        a_km=_first(e.a_km), e=_first(e.e), i_rad=_first(e.i_rad),
+        raan_rad=_first(e.raan_rad), argp_rad=_first(e.argp_rad), M0_rad=_first(e.M0_rad),
     )
-    seed_phys = SatellitePhysical(
-        bc_kg_m2=_first(s.bc_kg_m2)
-    )
-    return Layer(elems=seed_elems, phys=seed_phys, spec=dict(layer.spec))
-
-
-def rgt_subconstellation_layers(
-    inclinations_deg: list[float],
-    N_P: int,
-    N_D: int,
-    L: int,
-    earth: EarthConstants,
-    *,
-    raan0_deg: float = 0.0,
-    m0_deg: float = 0.0,
-    bc_kg_m2: float = 80.0,
-    use_j2: bool = True,
-    a_km_override: float | None = None,
-    dt_s: float | None = None,
-) -> list[Layer]:
-    """Build one common-ground-track Layer per inclination.
-
-    Each element of the returned list is one sub-constellation.  Use seed_layer()
-    on each to extract the single-satellite layer for v_0 simulation, or pass the
-    full layers to recover orbital elements of BILP-selected slots.
-
-    Parameters
-    ----------
-    inclinations_deg : list of inclinations, one per sub-constellation
-    N_P, N_D, L      : shared RGT parameters (all sub-constellations must share T_r)
-    earth            : EarthConstants
-    raan0_deg        : seed RAAN for all sub-constellations (degrees)
-    m0_deg           : seed mean anomaly for all sub-constellations (degrees)
-    bc_kg_m2         : ballistic coefficient (kg/m²)
-    a_km_override    : shared semi-major axis (km) to use for all sub-constellations
-                       when use_j2=True; pass the J2-correct a_km at the reference
-                       inclination so all seeds share the same repeat period T_r.
-
-    Returns
-    -------
-    List[Layer], one per inclination, each containing L slots.
-    """
-    return [
-        rgt_common_ground_track_layer(
-            inc_deg=float(inc),
-            N_P=N_P, N_D=N_D, L=L,
-            earth=earth,
-            raan0_deg=raan0_deg,
-            m0_deg=m0_deg,
-            bc_kg_m2=bc_kg_m2,
-            use_j2=use_j2,
-            a_km_override=a_km_override,
-            dt_s=dt_s,
-        )
-        for inc in inclinations_deg
-    ]
+    return Layer(elems=seed_elems, spec=dict(layer.spec))

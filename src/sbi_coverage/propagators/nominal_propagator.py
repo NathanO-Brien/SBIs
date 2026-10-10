@@ -1,6 +1,9 @@
-"""Nominal analytical propagator: Keplerian two-body motion with optional
-J2 secular drift (RAAN, argument of perigee, and Lee's J2-corrected mean-anomaly
-rate) and an optional averaged exponential-atmosphere drag model.
+"""Nominal analytical propagator: secular-J2 motion following Lee et al. (2020).
+
+With ``SimConfig.use_j2=True`` (the setting the optimizer always uses) RAAN, argument of
+perigee and mean anomaly advance at Lee's secular rates (Eqs. 3-5), which makes repeat-ground-track
+closure exact. ``use_j2=False`` is plain two-body motion, kept only to replay results archived
+before the J2 work. There is no drag model.
 
 Implements the propagator interface expected by simulate.run_simulation():
 init_state() and step_state_to_eci_positions().
@@ -8,12 +11,12 @@ init_state() and step_state_to_eci_positions().
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 
 from sbi_coverage.core.config import EarthConstants, SimConfig
-from sbi_coverage.core.elements import OrbitalElements, SatellitePhysical
+from sbi_coverage.core.elements import OrbitalElements
 
 
 def mean_motion_rad_s(a_km: np.ndarray, mu_km3_s2: float) -> np.ndarray:
@@ -103,54 +106,6 @@ def lee_mean_anomaly_rate_rad_s(a_km, e, i_rad, earth: EarthConstants) -> np.nda
     return n * (1.0 - k * np.sqrt(1.0 - e * e) * (1.5 * np.sin(i_rad) ** 2 - 1.0))
 
 
-def density_exponential_kg_m3(h_km: np.ndarray, sim: SimConfig) -> np.ndarray:
-    """Exponential atmosphere density model: rho(h) = rho_scale * rho0 * exp(-(h-h0)/H)."""
-    rho_scale = float(getattr(sim, "rho_scale", 1.0))
-    rho0 = float(getattr(sim, "rho0_kg_m3", 3.614e-13))
-    h0_km = float(getattr(sim, "h0_km", 700.0))
-    H_km = float(getattr(sim, "H_km", 88.667))
-    expo = -((h_km - h0_km) / np.maximum(H_km, 1e-12))
-    expo = np.clip(expo, -80.0, 80.0)  # Keep exp() numerically stable.
-    return rho_scale * rho0 * np.exp(expo)
-
-
-def drag_update_a_avg(
-    a_km: np.ndarray,
-    e: np.ndarray,
-    phys: SatellitePhysical,
-    sim: SimConfig,
-    earth: EarthConstants,
-    dt_s: float,
-) -> np.ndarray:
-    """
-    Averaged drag decay of the semi-major axis over one timestep.
-
-    Uses the mean of the atmospheric density at perigee and apogee altitudes
-    and da/dt = -2 a^2 v a_drag / mu, floored at drag_floor_alt_km.
-    """
-    rp_km = a_km * (1.0 - e)
-    ra_km = a_km * (1.0 + e)
-
-    hp_km = np.maximum(rp_km - earth.r_eq_km, 0.0)
-    ha_km = np.maximum(ra_km - earth.r_eq_km, 0.0)
-
-    rho_p = density_exponential_kg_m3(hp_km, sim)
-    rho_a = density_exponential_kg_m3(ha_km, sim)
-    rho = 0.5 * (rho_p + rho_a)
-
-    v_m_s = 1000.0 * np.sqrt(earth.mu_km3_s2 / np.maximum(a_km, 1e-9))
-    a_drag_m_s2 = 0.5 * rho * (v_m_s**2) / np.maximum(phys.bc_kg_m2, 1e-12)
-
-    a_m = 1000.0 * a_km
-    mu_m3_s2 = earth.mu_km3_s2 * (1000.0**3)
-    da_dt_m_s = -2.0 * (a_m**2) * v_m_s * a_drag_m_s2 / np.maximum(mu_m3_s2, 1e-30)
-
-    a_m_new = a_m + da_dt_m_s * dt_s
-    drag_floor_alt_km = float(getattr(sim, "drag_floor_alt_km", 120.0))
-    a_m_new = np.maximum(a_m_new, 1000.0 * (earth.r_eq_km + drag_floor_alt_km))
-    return a_m_new / 1000.0
-
-
 @dataclass
 class PropState:
     """
@@ -165,19 +120,8 @@ class PropState:
     M_rad: np.ndarray
 
 
-def init_state(
-    *,
-    elems0: OrbitalElements,
-    r0_eci_km: np.ndarray,
-    v0_eci_km_s: np.ndarray,
-    phys: SatellitePhysical,
-    sim: SimConfig,
-    earth: EarthConstants,
-) -> PropState:
-    """
-    Initialize stepwise state from epoch elements.
-    (r0/v0 accepted for interface compatibility but not needed here.)
-    """
+def init_state(*, elems0: OrbitalElements, sim: SimConfig, earth: EarthConstants) -> PropState:
+    """Initialize stepwise state from the epoch elements (always starts from M0_rad)."""
     return PropState(
         a_km=np.asarray(elems0.a_km, dtype=np.float64).copy(),
         e=np.asarray(elems0.e, dtype=np.float64).copy(),
@@ -191,30 +135,20 @@ def init_state(
 def step_state_to_eci_positions(
     *,
     state: PropState,
-    phys: SatellitePhysical,
     dt_s: float,
-    t_s: Optional[float] = None,
     sim: SimConfig,
     earth: EarthConstants,
 ) -> np.ndarray:
-    """
-    Advance the propagation state by dt_s and return ECI positions (Nsats x 3).
-    """
-    use_drag = bool(getattr(sim, "use_drag", False))
-    use_j2 = bool(getattr(sim, "use_j2", True))
+    """Advance the propagation state by dt_s and return ECI positions (Nsats x 3)."""
+    use_j2 = sim.use_j2
 
-    if use_drag and dt_s > 0.0:
-        state.a_km = drag_update_a_avg(state.a_km, state.e, phys, sim, earth, dt_s=dt_s)
-
-    # Optional J2 secular drift
     if use_j2 and dt_s > 0.0:
         Omegadot, omegadot = j2_secular_rates_rad_s(state.a_km, state.e, state.i_rad, earth)
         state.raan_rad = state.raan_rad + Omegadot * dt_s
         state.argp_rad = state.argp_rad + omegadot * dt_s
 
-    # Mean anomaly update (with updated a(t)).  With J2 on, use Lee's corrected
-    # mean-anomaly rate (Eq. 5) so ground-track closure is exact; J2 off keeps the
-    # plain two-body mean motion.
+    # Lee's J2-corrected mean-anomaly rate (Eq. 5) so ground-track closure is exact;
+    # J2 off uses the plain two-body mean motion.
     if use_j2:
         Mdot = lee_mean_anomaly_rate_rad_s(state.a_km, state.e, state.i_rad, earth)
     else:
@@ -228,23 +162,14 @@ def step_state_to_eci_positions(
     cos_nu = (np.cos(E) - state.e) / np.maximum(1.0 - state.e * np.cos(E), 1e-12)
     nu = np.arctan2(sin_nu, cos_nu)
 
-    return elements_to_eci_km(
-        state.a_km,
-        state.e,
-        state.i_rad,
-        state.raan_rad,
-        state.argp_rad,
-        nu,
-        earth,
-    )
+    return elements_to_eci_km(state.a_km, state.e, state.i_rad, state.raan_rad, state.argp_rad, nu, earth)
 
 
-def get_metadata(*, state: PropState, sim: SimConfig, earth: EarthConstants, phys: SatellitePhysical) -> dict[str, Any]:
+def get_metadata(*, sim: SimConfig) -> dict[str, Any]:
     """Return propagator identification and settings for run metadata."""
     return {
         "name": "Nominal_Propagator",
-        "epoch0": getattr(sim, "epoch0", "J2000"),
+        "epoch0": sim.epoch0,
         "units": {"r": "km", "v": "km/s", "t": "s"},
-        "use_j2": bool(getattr(sim, "use_j2", True)),
-        "use_drag": bool(getattr(sim, "use_drag", False)),
+        "use_j2": bool(sim.use_j2),
     }

@@ -4,8 +4,9 @@ from coverage geometry.
 from __future__ import annotations
 
 import numpy as np
-from ..core.config import EarthConstants
-from ..core.elements import OrbitalElements, SatellitePhysical
+from ...core.config import EarthConstants
+from ...core.elements import OrbitalElements
+from ._physical import SatellitePhysical
 from .layer import Layer
 
 def auto_walker_delta(

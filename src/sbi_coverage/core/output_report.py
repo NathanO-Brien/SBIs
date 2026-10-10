@@ -338,24 +338,13 @@ def _print_metadata(ao: Analysis, *, advanced: bool = False) -> None:
                 else:
                     _print_kv(top_key, inputs[top_key], indent=2)
         if advanced:
-            for top_key in ["elements0", "physical"]:
+            for top_key in ["elements0"]:
                 if top_key in inputs:
                     print(f"\ninputs.{top_key}:")
                     if isinstance(inputs[top_key], dict):
                         _print_dict(inputs[top_key], indent=2)
                     else:
                         _print_kv(top_key, inputs[top_key], indent=2)
-    else:
-        # Backward compatibility for old metadata shape
-        print("inputs.layers:")
-        _print_layers_hierarchical(meta.get("layers"), indent=2)
-        for top_key in ["shell_meta", "sim", "coverage", "earth"]:
-            if top_key in meta:
-                print(f"\n{top_key}:")
-                if isinstance(meta[top_key], dict):
-                    _print_dict(meta[top_key], indent=2)
-                else:
-                    _print_kv(top_key, meta[top_key], indent=2)
 
     if "propagator_meta" in meta:
         print("\npropagator_meta:")

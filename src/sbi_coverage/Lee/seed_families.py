@@ -14,8 +14,8 @@ has a unique (a', i') on the shared-Omega_dot curve: cos(i') = -Omega_dot*/(k n)
 is closed-form in a', and closure is then a 1-D root in a'.  Higher a' gives lower
 i', so the anchor (highest inclination) is also the lowest-altitude family.
 
-Altitude bounds: the lower bound is fixed at 200 km (the intercept shell altitude
-by default).  There is NO hard-coded upper bound: the upper bound is the
+Altitude bounds: the lower bound is ``alt_min_km`` (200 km by default; it is NOT tied to the
+intercept altitude). There is NO hard-coded upper bound: the upper bound is the
 altitude beyond which no seed can have the target shell within interceptor
 range, h_max = intercept_alt + R_max, with R_max taken from the scenario's
 CoverageConfig (cov.max_range_km).  Seeds near h_max see almost none of the shell
@@ -26,7 +26,8 @@ anchor sits at the highest target latitude and the seed filter prunes families
 that turn out not to be worth it).  For each candidate anchor N_P the closure
 fixes the anchor altitude; the candidate whose synchronized members (altitude
 within bounds, inclination between the useful floor and i_top) are most numerous
-wins; ties go to the lower altitude.
+wins; ties go to the lower altitude. (The score counts rungs, not coverage value: the seed filter
+decides later which kept rungs are worth using.)
 
 Useful floor: a family at inclination i with ground reach R(h) (central angle,
 see footprint_reach_deg) can only touch a target if i + R(h) >= lat_min, so a
@@ -45,7 +46,7 @@ import numpy as np
 from scipy.optimize import brentq
 
 from ..core.config import CoverageConfig, EarthConstants
-from .rgt_slots import a_km_j2_rgt, lee_j2_rates, rgt_closure_residual
+from .rgt_slots import a_km_j2_rgt, inclination_for_omega_dot, lee_j2_rates, rgt_closure_residual
 
 DEFAULT_ND = 3
 DEFAULT_ALT_MIN_KM = 200.0
@@ -101,12 +102,12 @@ def footprint_reach_deg(alt_km: float, cov: CoverageConfig, earth: EarthConstant
     return float(np.rad2deg(lo))
 
 
-def _np_candidates(N_D: int, alt_bounds_km: tuple[float, float], earth: EarthConstants) -> range:
-    """N_P scan range that brackets the altitude bounds.
+def _np_range(N_D: int, alt_bounds_km: tuple[float, float], earth: EarthConstants) -> range:
+    """Range of N_P values that brackets the altitude bounds.
 
     N_P / N_D is (to within J2 corrections of a few percent) the number of orbits per
     sidereal day, T_sid / T_kepler(h); the range is that ratio at the upper and lower
-    altitude bound times N_D, padded by 3 on each side.
+    altitude bound times N_D, padded by 3% (at least 3) on each side to cover the J2 shift.
     """
     T_sid = 2.0 * np.pi / earth.omega_earth_rad_s
 
@@ -114,9 +115,9 @@ def _np_candidates(N_D: int, alt_bounds_km: tuple[float, float], earth: EarthCon
         a = earth.r_eq_km + h_km
         return N_D * T_sid / (2.0 * np.pi * np.sqrt(a ** 3 / earth.mu_km3_s2))
 
-    lo = max(1, int(np.floor(nP(alt_bounds_km[1]))) - 3)
-    hi = int(np.ceil(nP(alt_bounds_km[0]))) + 3
-    return range(lo, hi + 1)
+    n_lo, n_hi = nP(alt_bounds_km[1]), nP(alt_bounds_km[0])
+    pad = max(3, int(np.ceil(0.03 * n_hi)))
+    return range(max(1, int(np.floor(n_lo)) - pad), int(np.ceil(n_hi)) + pad + 1)
 
 
 def _shared_omega_dot_residual(a_km: float, N_P: int, N_D: int, omega_dot_star: float,
@@ -125,16 +126,13 @@ def _shared_omega_dot_residual(a_km: float, N_P: int, N_D: int, omega_dot_star: 
 
     Returns NaN where no real inclination exists (|cos i| > 1) or cos i <= 0.
     """
-    n = np.sqrt(earth.mu_km3_s2 / a_km ** 3)
-    kn = 1.5 * earth.j2 * (earth.r_eq_km / a_km) ** 2 * n
-    cos_i = -omega_dot_star / kn
-    if not (0.0 < cos_i <= 1.0):
+    inc_deg = inclination_for_omega_dot(a_km, omega_dot_star, earth)
+    if not np.isfinite(inc_deg):
         return float("nan")
-    inc_deg = float(np.rad2deg(np.arccos(cos_i)))
     return rgt_closure_residual(a_km, N_P, N_D, inc_deg, earth)
 
 
-def solve_member(N_P: int, N_D: int, omega_dot_star: float, earth: EarthConstants,
+def solve_family_on_omega_curve(N_P: int, N_D: int, omega_dot_star: float, earth: EarthConstants,
                  alt_bounds_km: tuple[float, float], allow_reducible: bool = True) -> dict | None:
     """Unique (a, i) for N_P:N_D with Omega_dot == omega_dot_star inside the altitude bounds.
 
@@ -163,10 +161,9 @@ def solve_member(N_P: int, N_D: int, omega_dot_star: float, earth: EarthConstant
 
 def _family_record(N_P: int, N_D: int, a_km: float, inc_deg: float | None,
                    earth: EarthConstants, omega_dot_star: float | None = None) -> dict:
+    """Describe one family: (N_P, N_D, i, a), its secular rates, T_r, RAAN window and repeat factor g."""
     if inc_deg is None:
-        n = np.sqrt(earth.mu_km3_s2 / a_km ** 3)
-        kn = 1.5 * earth.j2 * (earth.r_eq_km / a_km) ** 2 * n
-        inc_deg = float(np.rad2deg(np.arccos(-omega_dot_star / kn)))
+        inc_deg = inclination_for_omega_dot(a_km, omega_dot_star, earth)
     Om, om, Md = lee_j2_rates(a_km, inc_deg, earth)
     T_r = N_D * 2.0 * np.pi / (earth.omega_earth_rad_s - Om)
     return dict(
@@ -205,12 +202,13 @@ def plan_seed_families(
     alt_min_km    : lower altitude bound (default 200 km).
     alt_max_km    : upper altitude bound; default None -> intercept_alt + R_max from `cov`.
 
-    Returns dict(anchor, families, T_r_s, L, dt_s, i_top_deg, inc_floor_deg (lowest
-    per-family floor), alt_bounds_km, n_anchor_candidates, plus a `generation` dict
-    describing the seed generation (target latitude statistics and counts of the unique
-    altitude/inclination combinations generated, kept and dropped)).  Each family also
-    carries reach_deg and inc_floor_deg.  `families` is sorted by inclination
-    descending; families[0] is the anchor.
+    Returns dict(anchor, families, T_r_s, L, dt_s, N_D, alt_bounds_km, anchor_lat_margin_deg,
+    generation). ``families`` is sorted by inclination descending (families[0] is the anchor); each
+    family dict carries N_P, N_D, inc_deg, alt_km, a_km, T_r_s, reach_deg, inc_floor_deg,
+    raan_interval_deg, reducible/reduced_ratio/repeat_factor and the secular rates. ``L`` is the number
+    of time steps in the shared repeat period (a multiple of every kept family's repeat factor) and
+    dt_s = T_r_s / L. ``generation`` summarizes the seed generation: target-latitude statistics and
+    counts of the unique altitude/inclination combinations generated, kept and dropped.
     """
     earth = earth or EarthConstants()
     alt_bounds = resolve_alt_bounds(cov, alt_min_km, alt_max_km)
@@ -230,14 +228,17 @@ def plan_seed_families(
     n_cand = 0
     anchor_candidates: list[dict] = []
     all_combos: set[tuple[float, float]] = set()
-    for N_P_a in _np_candidates(N_D, alt_bounds, earth):
+    n_rejected_bounds = n_rejected_unconverged = 0
+    for N_P_a in _np_range(N_D, alt_bounds, earth):
         if not allow_reducible and gcd(N_P_a, N_D) != 1:
             continue
         a_a = a_km_j2_rgt(N_P_a, N_D, i_top, earth)
         alt_a = a_a - earth.r_eq_km
         if not (alt_bounds[0] <= alt_a <= alt_bounds[1]):
+            n_rejected_bounds += 1
             continue
         if abs(rgt_closure_residual(a_a, N_P_a, N_D, i_top, earth)) > 1e-12:
+            n_rejected_unconverged += 1     # closure Newton solve did not converge
             continue
         n_cand += 1
         anchor = _family_record(N_P_a, N_D, a_a, i_top, earth)
@@ -246,10 +247,10 @@ def plan_seed_families(
         generated = [anchor]
         members = []
         dropped = []
-        for N_P_m in _np_candidates(N_D, alt_bounds, earth):
+        for N_P_m in _np_range(N_D, alt_bounds, earth):
             if N_P_m == N_P_a or (not allow_reducible and gcd(N_P_m, N_D) != 1):
                 continue
-            m = solve_member(N_P_m, N_D, anchor["Omegadot_rad_s"], earth, alt_bounds, allow_reducible)
+            m = solve_family_on_omega_curve(N_P_m, N_D, anchor["Omegadot_rad_s"], earth, alt_bounds, allow_reducible)
             if m is None:
                 continue
             m["reach_deg"] = _reach(m["alt_km"])
@@ -300,57 +301,16 @@ def plan_seed_families(
         n_unique_alt_inc_combos_all_candidates=int(len(all_combos)),
         n_unique_alt_inc_combos_chosen_ladder=int(len({_combo_key(f) for f in generated})),
         n_unique_alt_inc_combos_kept=int(len({_combo_key(f) for f in fams})),
-        n_combos_dropped=int(len(dropped)),
-        dropped_combos=[
-            dict(N_P=int(m["N_P"]), N_D=int(m["N_D"]), inc_deg=float(m["inc_deg"]), alt_km=float(m["alt_km"]), reason=why)
-            for m, why in dropped
-        ],
+        n_combos_dropped=int(len(dropped)),     # chosen-ladder rungs above the anchor inclination or below the reach floor
+        n_anchor_rejected_out_of_bounds=int(n_rejected_bounds),
+        n_anchor_rejected_unconverged=int(n_rejected_unconverged),
         anchor_candidates=anchor_candidates,
     )
     return dict(
         anchor=anchor, families=fams, T_r_s=float(T_r), L=L, dt_s=float(T_r / L),
-        N_D=int(N_D), i_top_deg=float(i_top),
-        inc_floor_deg=float(min(f["inc_floor_deg"] for f in fams)),
-        lat_max_deg=lat_max, lat_min_deg=lat_min, alt_bounds_km=tuple(alt_bounds),
-        anchor_lat_margin_deg=float(anchor_lat_margin_deg), useful_reach_deg=float(useful_reach_deg),
-        n_anchor_candidates=n_cand, generation=generation,
+        N_D=int(N_D), alt_bounds_km=tuple(alt_bounds),
+        anchor_lat_margin_deg=float(anchor_lat_margin_deg), generation=generation,
     )
-
-
-def ladder_from_pin(
-    N_P_pin: int,
-    pin_inc_deg: float,
-    *,
-    earth: EarthConstants | None = None,
-    N_D: int = DEFAULT_ND,
-    alt_min_km: float = DEFAULT_ALT_MIN_KM,
-    alt_max_km: float | None = None,
-    cov: CoverageConfig | None = None,
-    lat_min_deg: float | None = None,
-    allow_reducible: bool = True,
-) -> list[dict]:
-    """All synchronized rungs (any inclination) for the ladder that passes through
-    (N_P_pin, pin_inc_deg).  If cov and lat_min_deg are given, rungs whose inclination
-    is below lat_min - reach(alt) are dropped.  Sorted by inclination descending."""
-    earth = earth or EarthConstants()
-    alt_bounds = resolve_alt_bounds(cov, alt_min_km, alt_max_km)
-    a_p = a_km_j2_rgt(N_P_pin, N_D, pin_inc_deg, earth)
-    if not (alt_bounds[0] <= a_p - earth.r_eq_km <= alt_bounds[1]):
-        return []
-    pin = _family_record(N_P_pin, N_D, a_p, pin_inc_deg, earth)
-    rungs = [pin]
-    for N_P_m in _np_candidates(N_D, alt_bounds, earth):
-        if N_P_m == N_P_pin:
-            continue
-        m = solve_member(N_P_m, N_D, pin["Omegadot_rad_s"], earth, alt_bounds, allow_reducible)
-        if m is not None:
-            rungs.append(m)
-    for r in rungs:
-        r["reach_deg"] = footprint_reach_deg(r["alt_km"], cov, earth) if cov is not None else DEFAULT_USEFUL_REACH_DEG
-        r["inc_floor_deg"] = max(0.0, (lat_min_deg or 0.0) - r["reach_deg"])
-    if lat_min_deg is not None:
-        rungs = [r for r in rungs if r["inc_deg"] >= r["inc_floor_deg"]]
-    return sorted(rungs, key=lambda r: -r["inc_deg"])
 
 
 def n_distinct_slots(family: dict, L: int) -> int:

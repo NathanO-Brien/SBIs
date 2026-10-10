@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from ..core.elements import OrbitalElements, SatellitePhysical
+from ...core.elements import OrbitalElements
+from ._physical import SatellitePhysical
 
 
 @dataclass(frozen=True)
