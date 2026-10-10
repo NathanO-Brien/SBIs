@@ -104,11 +104,13 @@ class FakeBatch:
         self.jobs.append(kw)
         return {"jobId": f"id-{self.n}"}
 s3f, bf = FakeS3(), FakeBatch(fail_every=3)
-prog = []
-res = lc.submit_runs(plan.configs, s3=s3f, batch=bf, progress=lambda d, n: prog.append(d), max_workers=2)
+import threading
+prog, prog_threads = [], set()
+res = lc.submit_runs(plan.configs, s3=s3f, batch=bf, progress=lambda d, n: (prog.append(d), prog_threads.add(threading.get_ident())), max_workers=2)
 check("every config uploaded, one result each", len(res) == 3 and len(s3f.puts) == 3)
 check("one failure captured, others submitted", sorted(r["status"] for r in res) == ["FAILED_TO_SUBMIT", "SUBMITTED", "SUBMITTED"])
 check("progress reported", prog and prog[-1] == 3)
+check("progress callback runs on the calling thread (Streamlit needs this)", prog_threads == {threading.get_ident()})
 check("job names unique and Batch-legal", len({r["job_name"] for r in res}) == 3 and all(__import__("re").fullmatch(r"[A-Za-z0-9_-]{1,128}", r["job_name"]) for r in res))
 sent = json.loads(next(iter(s3f.puts.values())))
 check("config JSON uses current vocabulary", "burnout_velocity_km_s" in sent and "max_accel_g" in sent and "v_bo_km_s" not in sent)
@@ -153,6 +155,45 @@ with tempfile.TemporaryDirectory() as td:
     p2 = exp.save_export(folder, "my file?.csv", b"2")
     check("filename sanitized, no overwrite", p1.name == "my_file_.csv" and p2.name == "my_file__1.csv" and p1.read_bytes() == b"1")
 check("empty export folder rejected", exp.validate_export_dir("  ")[1] is not None)
+
+print("\njob control, guardrails, clone, orbit-plan preview")
+class FakeBatchT:
+    def __init__(self): self.terminated = []
+    def terminate_job(self, jobId, reason):
+        if jobId == "bad":
+            raise RuntimeError("denied")
+        self.terminated.append(jobId)
+bt = FakeBatchT()
+rr = lc.terminate_jobs(bt, ["a", "bad", "c"], max_workers=2)
+check("terminate_jobs: failures isolated", [r["ok"] for r in rr] == [True, False, True] and sorted(bt.terminated) == ["a", "c"])
+check("guardrails block too many jobs / hours / active", len(lc.check_guardrails(n_jobs=300, hours=5000, active_jobs=380, max_jobs=200, max_hours=1000, max_active=400)) == 3)
+check("guardrails allow a small submission", lc.check_guardrails(n_jobs=5, hours=10, active_jobs=0, max_jobs=200, max_hours=1000, max_active=400) == [])
+rc_syn = {"salvo_size": 12, "n_interceptors_per_sat": 2, "burnout_velocity_km_s": 6.0, "max_accel_g": 10.0, "detection_time_s": 15.0,
+          "decision_time_s": 0.0, "target_missile_burnout_time_s": 170.0, "intercept_alt_km": 200.0, "min_elev_deg": 0.0, "nd_repeat": 3,
+          "altitude_bounds_km": [200.0, 946.0], "anchor_lat_margin_deg": 0.0, "dt_target_s": 120.0, "scenario": "NK", "is_principal_set": True,
+          "is_test_run": True, "target_mode": "prespecified",
+          "seed_filter": {"raan_step_deg": 0.25, "margin_multiplier": 5.0, "trim_margin_multiplier": 2.0, "max_seeds": 200},
+          "solver": {"mip_gap_target": 0.01, "time_limit_s": 600.0}}
+side_syn = {"run_name": "X", "run_config": rc_syn, "targets": [{"name": "A, B", "lat_deg": 39.7, "lon_deg": 124.7}], "countries": []}
+f = lc.form_from_sidecar(side_syn)
+check("clone: grid text and advanced values", f["grid"]["salvo_size"] == "12" and f["grid"]["burnout_velocity_km_s"] == "6" and f["advanced"]["time_limit_s"] == 600.0
+      and f["advanced"]["raan_step_deg"] == 0.25 and f["scenario"] == "NK" and f["principal"] and f["test"])
+txt = lc.points_to_csv_text(f["points"])
+pp, _ = parse_target_points_text(txt)
+check("clone: targets survive the CSV text round trip (comma in a name)", pp[0][0] == "A, B" and abs(pp[0][1] - 39.7) < 1e-9)
+cfg_rt = lc.build_grid_plan(target={"mode": "prespecified", "points": pp},
+                            grid={k: lc.parse_number_list(v, name=k, kind=lc.GRID_FIELDS[k]["kind"]) for k, v in f["grid"].items()},
+                            fixed={**{k: lc.CONFIG_DEFAULTS[k] for k in lc.ADVANCED_FIELDS}, **f["advanced"]}, scenario=f["scenario"], label=None,
+                            principal=f["principal"], test=f["test"]).configs[0]
+check("clone: plan reproduces the stored settings", cfg_rt["salvo_size"] == 12 and cfg_rt["n_interceptors_per_sat"] == 2 and cfg_rt["time_limit_s"] == 600.0)
+check("clone: sidecar without targets rejected with guidance", raises(lambda: lc.form_from_sidecar({"run_config": rc_syn, "targets": []}), lc.InputProblems))
+check("clone: old sidecar missing inputs rejected", raises(lambda: lc.form_from_sidecar({"run_config": {}, "targets": [{"name": "a", "lat_deg": 1, "lon_deg": 2}]}), lc.InputProblems))
+pvs = lc.preview_orbit_plan(pts, plan.configs)
+check("preview: families, seeds and altitude computed", pvs and pvs[0]["error"] is None and pvs[0]["n_seeds"] > 0 and pvs[0]["anchor_alt_km"] > 200 and pvs[0]["families"])
+eq = lc.preview_orbit_plan([["eq", 0.0, 10.0]], plan.configs)
+check("preview: equatorial-only targets give a clear error, not a crash", eq and eq[0]["error"] and eq[0]["warnings"])
+check("preview: short vs long range cases when ranges differ",
+      len(lc.preview_orbit_plan(pts, lc.build_grid_plan(target=TARGET, grid={**GRID, "burnout_velocity_km_s": [4.0, 6.0]}, fixed=FIXED, scenario="NK", label=None, principal=False, test=True).configs)) == 2)
 
 print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"{len(FAILS)} CHECK(S) FAILED:\n  " + "\n  ".join(FAILS)))
 sys.exit(0 if not FAILS else 1)

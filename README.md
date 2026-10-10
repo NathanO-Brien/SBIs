@@ -37,7 +37,7 @@ data/targets/   example target-point CSVs
 | One cloud run | `python scripts/cloud_run.py --target-points-csv data/targets/pacific_blob1.csv --salvo 5 --test-run` |
 | A parameter grid in the cloud | `python scripts/cloud_sweep.py --target-points-csv <csv> --scenario NK --grid grid.json` |
 | The same grid locally (to test) | `python scripts/cloud_sweep.py ... --local --max-jobs 2 --time-limit 60` |
-| **GUI**: launch many runs, watch jobs, pull/plot/export results (cloud only) | `streamlit run scripts/sbi_gui.py` |
+| **GUI** (cloud only): launch grids of runs with a pre-launch orbit plan and 3-D target globe, cancel/monitor jobs, clone a past run, compare and export results | `streamlit run scripts/sbi_gui.py` |
 | Pull cloud runs locally | `python scripts/sync_results_from_s3.py --folder results` |
 | Re-simulate a result and check coverage | `python scripts/check_result_coverage.py <run name or S3 URI>` |
 | Coverage plots / video, gap diagnosis | `scripts/coverage_from_sclp.py`, `scripts/diagnose_coverage_gaps.py` |

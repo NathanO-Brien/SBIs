@@ -190,6 +190,13 @@ with st.sidebar:
     st.caption(f"**Results** `s3://{S3_BUCKET}/{S3_RUNS_PREFIX}`  \n**Batch queue** `{JOB_QUEUE}`")
     st.text_input("Export folder", value=str(exp.DEFAULT_EXPORT_DIR), key="export_dir",
                   help="'Save to export folder' buttons write CSV/JSON here. The browser 'Download' buttons use your normal download folder.")
+    with st.expander("Safety limits"):
+        st.number_input("Max jobs per submission", 1, 5000, 200, key="lim_jobs",
+                        help="A submission larger than this is blocked until you raise the limit.")
+        st.number_input("Max worst-case compute-hours per submission", 1.0, 100000.0, 1000.0, key="lim_hours",
+                        help="Jobs x solver time limit. Prevents an accidental very large bill.")
+        st.number_input("Max active (queued + running) jobs", 1, 10000, 400, key="lim_active",
+                        help="Counts jobs already in the queue; blocks submissions that would exceed it.")
     if st.button("Re-check AWS connection", icon=":material/refresh:", width="stretch"):
         _aws_problems.clear()
         st.rerun()
@@ -219,22 +226,28 @@ def render_launch() -> None:
         # ---- 1. targets -------------------------------------------------------------------------
         with st.container(border=True):
             step_header(1, "Targets", "Where the missiles launch from: the points every salvo must be able to intercept.")
+            st.session_state.setdefault("target_mode_radio", "Prespecified points")
             mode = st.radio("Target mode", ["Prespecified points", "Country mode (deprecated)"], horizontal=True, label_visibility="collapsed",
+                            key="target_mode_radio",
                             help="Prespecified: exactly the points you upload. Country: every globe point inside the chosen country(ies).")
             if mode.startswith("Prespecified"):
-                up = st.file_uploader("Upload a CSV with Name, Lat, Lon columns", type=["csv", "txt"], key="target_upload",
-                                      help="One target per row; header like Name,Lat,Lon (decimal degrees, +north/+east). Comma, semicolon or tab separated.")
-                with st.expander("...or paste CSV text"):
-                    pasted = st.text_area("CSV text", height=110, key="target_paste", label_visibility="collapsed",
-                                          placeholder="Name,Lat,Lon\nSohae,39.66,124.70\nYongbyon,39.79,125.75")
+                st.session_state.setdefault("target_source", "Upload file")
+                src = st.radio("Target source", ["Upload file", "Paste text"], horizontal=True, key="target_source",
+                               help="Choose where the target list comes from; the other source is ignored.")
                 text = source = None
-                if up is not None:
-                    try:
-                        text, source, state["filename"] = up.getvalue().decode("utf-8-sig"), up.name, up.name
-                    except UnicodeDecodeError:
-                        st.error("The file is not UTF-8 text. In Excel use 'Save As > CSV UTF-8'.")
-                elif pasted.strip():
-                    text, source = pasted, "pasted text"
+                if src == "Upload file":
+                    up = st.file_uploader("Upload a CSV with Name, Lat, Lon columns", type=["csv", "txt"], key="target_upload",
+                                          help="One target per row; header like Name,Lat,Lon (decimal degrees, +north/+east). Comma, semicolon or tab separated.")
+                    if up is not None:
+                        try:
+                            text, source, state["filename"] = up.getvalue().decode("utf-8-sig"), up.name, up.name
+                        except UnicodeDecodeError:
+                            st.error("The file is not UTF-8 text. In Excel use 'Save As > CSV UTF-8'.")
+                else:
+                    pasted = st.text_area("CSV text", height=130, key="target_paste", label_visibility="collapsed",
+                                          placeholder="Name,Lat,Lon\nSohae,39.66,124.70\nYongbyon,39.79,125.75")
+                    if pasted.strip():
+                        text, source = pasted, "pasted text"
                 if text is not None:
                     try:
                         points, warns = parse_target_points_text(text, source=source)
@@ -259,11 +272,12 @@ def render_launch() -> None:
                            "Prefer prespecified points.")
                 names = _countries()
                 if names:
-                    countries_sel = st.multiselect("Countries", names, help="Names from Natural Earth; several are combined into one target set.")
+                    countries_sel = st.multiselect("Countries", names, key="countries_sel", help="Names from Natural Earth; several are combined into one target set.")
                 else:
                     st.caption("Country list unavailable (offline or geopandas missing); type names instead.")
-                    countries_sel = [c.strip() for c in st.text_input("Countries (comma separated)").split(",") if c.strip()]
-                n_points = int(st.number_input("Globe points", min_value=1000, max_value=200000, value=15000, step=1000,
+                    countries_sel = [c.strip() for c in st.text_input("Countries (comma separated)", key="countries_text").split(",") if c.strip()]
+                st.session_state.setdefault("globe_points", 15000)
+                n_points = int(st.number_input("Globe points", min_value=1000, max_value=200000, step=1000, key="globe_points",
                                                help="Size of the Fibonacci sphere sampled before masking to the country. More points = finer coverage "
                                                     "but a much larger optimization; the points that land inside the country are the targets."))
                 state["countries"] = countries_sel
@@ -289,12 +303,18 @@ def render_launch() -> None:
             step_header(2, "Run labels", "How these runs are named and tagged. Names look like CNp-s046-d15-v6-... (scenario, salvo, timing, ...).")
             c1, c2 = st.columns([1, 2])
             scen_default = lc.default_scenario(filename=state["filename"], countries=state["countries"])
-            scenario = c1.text_input("Scenario code", value=scen_default, key=f"scen_{scen_default}",
-                                     help="2-5 capital letters at the start of every run name, e.g. NK, CN.")
-            label = c2.text_input("Note (optional)", value="", help="Free text stored inside each result file.")
+            if st.session_state.get("_scen_default_prev") != scen_default:   # re-suggest when the target source changes
+                st.session_state["scenario_code"] = scen_default
+                st.session_state["_scen_default_prev"] = scen_default
+            st.session_state.setdefault("scenario_code", scen_default)
+            st.session_state.setdefault("launch_label", "")
+            st.session_state.setdefault("chk_principal", False)
+            st.session_state.setdefault("chk_test", True)
+            scenario = c1.text_input("Scenario code", key="scenario_code", help="2-5 capital letters at the start of every run name, e.g. NK, CN.")
+            label = c2.text_input("Note (optional)", key="launch_label", help="Free text stored inside each result file.")
             c3, c4 = st.columns(2)
-            principal = c3.checkbox("Principal set", help="Marks the runs as part of a principal research set (lowercase p in the name).")
-            test = c4.checkbox("Test run", value=True, help="Adds a TEST- prefix so these runs stay out of real results (hidden by default in Results).")
+            principal = c3.checkbox("Principal set", key="chk_principal", help="Marks the runs as part of a principal research set (lowercase p in the name).")
+            test = c4.checkbox("Test run", key="chk_test", help="Adds a TEST- prefix so these runs stay out of real results (hidden by default in Results).")
 
         # ---- 3. grid ----------------------------------------------------------------------------
         grid: dict[str, list] = {}
@@ -303,7 +323,8 @@ def render_launch() -> None:
             gcols = st.columns(2)
             for i, (key, spec) in enumerate(lc.GRID_FIELDS.items()):
                 with gcols[i % 2]:
-                    txt = st.text_input(spec["label"], value=spec["default"], help=spec["help"], key=f"grid_{key}")
+                    st.session_state.setdefault(f"grid_{key}", spec["default"])
+                    txt = st.text_input(spec["label"], help=spec["help"], key=f"grid_{key}")
                     try:
                         grid[key] = lc.parse_number_list(txt, name=spec["label"], kind=spec["kind"], minimum=spec["minimum"], maximum=spec["maximum"])
                         if len(grid[key]) > 1:
@@ -320,12 +341,13 @@ def render_launch() -> None:
                 for i, (key, spec) in enumerate(lc.ADVANCED_FIELDS.items()):
                     default = DEFAULT_TIME_LIMIT_S if key == "time_limit_s" else CONFIG_DEFAULTS[key]
                     with acols[i % 3]:
+                        st.session_state.setdefault(f"adv_{key}", int(default) if spec["kind"] is int else float(default))
                         if spec["kind"] is int:
                             fixed[key] = int(st.number_input(spec["label"], min_value=int(spec["minimum"]), max_value=int(spec["maximum"]),
-                                                             value=int(default), help=spec["help"], key=f"adv_{key}"))
+                                                             help=spec["help"], key=f"adv_{key}"))
                         else:
                             fixed[key] = float(st.number_input(spec["label"], min_value=float(spec["minimum"]), max_value=float(spec["maximum"]),
-                                                               value=float(default), format="%g", help=spec["help"], key=f"adv_{key}"))
+                                                               format="%g", help=spec["help"], key=f"adv_{key}"))
             skip_existing = st.checkbox("Skip combinations that already have a finished result in the cloud", value=False,
                                         help="Off: every combination runs, layering new runs on top (same-day repeats get the next sequence letter). "
                                              "On: combinations whose run identity already has a result are not submitted.")
@@ -355,6 +377,20 @@ def render_launch() -> None:
                     with st.expander(f"Combination table ({len(tbl)})", expanded=len(tbl) <= 24):
                         st.dataframe(tbl.drop(columns=["identity"]), width="stretch", hide_index=True)
                     export_buttons("plan (CSV)", exp.df_csv_bytes(tbl), f"launch_plan_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv", "text/csv", "plan")
+                    with guard("previewing the orbit plan"):
+                        previews = lc.preview_orbit_plan(state["points"], plan.configs)
+                        state["preview"] = previews
+                        panel_title("Orbit plan preview (before spending any compute)")
+                        for pv in previews:
+                            if pv["error"]:
+                                st.error(f"{pv['case'].capitalize()} ({pv['r_max_km']:.0f} km): {pv['error']}")
+                            else:
+                                st.markdown(f"**{pv['case'].capitalize()}** ({pv['r_max_km']:.0f} km): anchor inclination {pv['anchor_inc_deg']:.2f}°, "
+                                            f"anchor altitude {pv['anchor_alt_km']:.0f} km, altitude bounds {pv['alt_bounds_km'][0]:.0f}-{pv['alt_bounds_km'][1]:.0f} km, "
+                                            f"{len(pv['families'])} family(ies), {pv['n_seeds']} seeds, {pv['L']} time steps per repeat period.")
+                                st.dataframe(pd.DataFrame(pv["families"]), width="stretch", hide_index=True)
+                            for w in pv["warnings"]:
+                                st.warning(w)
 
     # ---- right: sticky preview + summary + submit -----------------------------------------------
     with right:
@@ -380,6 +416,10 @@ def render_launch() -> None:
             m3, m4 = st.columns(2)
             m3.metric("Already in cloud", int(dup.sum()) if len(dup) else 0)
             m4.metric("Worst-case time", f"{hours:,.1f} h")
+            pv = state.get("preview") or []
+            if pv and not pv[0]["error"]:
+                m5, m6 = st.columns(2)
+                m5.metric("Orbit families", len(pv[-1]["families"])); m6.metric("Seeds per run", pv[-1]["n_seeds"])
             st.markdown(
                 f'<div class="check">{"✅" if ready_t else "⬜"} Targets &nbsp; {"✅" if ready_g else "❌"} Settings grid &nbsp; '
                 f'{"✅" if plan is not None and not tbl.empty else "⬜"} Valid run plan</div>', unsafe_allow_html=True)
@@ -387,8 +427,21 @@ def render_launch() -> None:
             confirmed = True
             if n_sub > lc.CONFIRM_ABOVE:
                 confirmed = st.checkbox(f"I understand this launches {n_sub} AWS Batch jobs (up to {hours:,.0f} compute-hours).", key="confirm_big")
+            blocked: list[str] = []
+            if n_sub > 0:
+                try:
+                    active_now = sum(1 for j in _jobs(tuple(lc.ACTIVE_STATUSES), st.session_state.get("jobs_refresh", 0.0)))
+                except Exception:
+                    active_now = 0
+                blocked = lc.check_guardrails(n_jobs=n_sub, hours=hours, active_jobs=active_now, max_jobs=int(st.session_state["lim_jobs"]),
+                                              max_hours=float(st.session_state["lim_hours"]), max_active=int(st.session_state["lim_active"]))
+                for msg in blocked:
+                    st.error(msg, icon=":material/shield:")
+            if pv and all(p["error"] for p in pv):
+                blocked.append("planner found no feasible orbit family")
+                st.error("Submission blocked: the orbit planner cannot serve these targets with this interceptor range (see the preview in step 4).")
             if st.button(f"Submit {n_sub} job(s) to AWS", type="primary", icon=":material/rocket_launch:", width="stretch",
-                         disabled=not (n_sub > 0 and confirmed)):
+                         disabled=not (n_sub > 0 and confirmed and not blocked)):
                 s3, batch = _clients()
                 bar = st.progress(0.0, text="Submitting ...")
                 with guard("submitting jobs"):
@@ -397,6 +450,8 @@ def render_launch() -> None:
                     n_ok = sum(r["status"] == "SUBMITTED" for r in res)
                     (st.success if n_ok == len(res) else st.warning)(f"{n_ok} of {len(res)} job(s) submitted. Track them in the Jobs tab.")
                     st.session_state.setdefault("submissions", []).extend(res)
+                    _jobs.clear()   # make the Jobs tab show the new jobs immediately
+                    st.session_state["jobs_refresh"] = datetime.datetime.now().timestamp()
                     bad = [r for r in res if r["status"] != "SUBMITTED"]
                     if bad:
                         st.error(f"{len(bad)} job(s) failed to submit; first error: {bad[0]['error']}")
@@ -427,14 +482,47 @@ def render_jobs() -> None:
             cols = st.columns(max(len(counts), 1))
             for c, (s, n) in zip(cols, counts.items()):
                 c.metric(f"{STATUS_ICON.get(s, '⚪')} {s}", int(n))
+            for _c in ("created", "started", "stopped"):
+                jdf[_c] = pd.to_datetime(jdf[_c], utc=True)
             jdf["minutes"] = ((jdf["stopped"].fillna(pd.Timestamp.now(tz="UTC")) - jdf["started"]).dt.total_seconds() / 60).round(1)
             jdf.insert(0, "state", jdf["status"].map(lambda s: f"{STATUS_ICON.get(s, '⚪')} {s}"))
-            show = jdf.drop(columns=["job_id", "status"])
-            st.dataframe(show, width="stretch", hide_index=True, column_config={
+            show = jdf.drop(columns=["status"])
+            evj = st.dataframe(show, width="stretch", hide_index=True, on_select="rerun", selection_mode="multi-row", key="jobs_table", column_config={
+                "job_id": None,
                 "state": st.column_config.TextColumn("Status"), "job_name": st.column_config.TextColumn("Job", width="large"),
                 "created": st.column_config.DatetimeColumn("Created", format="MMM D, HH:mm"), "started": st.column_config.DatetimeColumn("Started", format="MMM D, HH:mm"),
                 "stopped": st.column_config.DatetimeColumn("Stopped", format="MMM D, HH:mm"), "minutes": st.column_config.NumberColumn("Minutes", format="%.1f"),
                 "reason": st.column_config.TextColumn("Reason")})
+            with st.container(border=True):
+                panel_title("Cancel jobs")
+                _, batch = _clients()
+                picked = [jdf.iloc[i] for i in evj.selection.rows]
+                picked_active = [r for r in picked if r["status"] in lc.ACTIVE_STATUSES]
+                sess_ids = {r["job_id"] for r in st.session_state.get("submissions", []) if r.get("job_id")}
+                sess_active = [r for r in jdf.to_dict("records") if r["job_id"] in sess_ids and r["status"] in lc.ACTIVE_STATUSES]
+                all_active = [r for r in jdf.to_dict("records") if r["status"] in lc.ACTIVE_STATUSES]
+                k1, k2, k3 = st.columns(3)
+                st.caption("Select rows in the table above, then cancel them. Queued jobs are cancelled; running jobs are stopped (their run will not "
+                           "appear in Results). Finished jobs cannot be cancelled.")
+
+                def _do_cancel(rows, what):
+                    with guard("cancelling jobs"):
+                        res = lc.terminate_jobs(batch, [r["job_id"] for r in rows])
+                        ok = sum(r["ok"] for r in res)
+                        (st.success if ok == len(res) else st.warning)(f"{what}: {ok} of {len(res)} job(s) cancelled.")
+                        for r in [r for r in res if not r["ok"]][:3]:
+                            st.error(r["error"])
+                        st.session_state["jobs_refresh"] = datetime.datetime.now().timestamp()
+
+                if k1.button(f"Cancel selected ({len(picked_active)})", icon=":material/cancel:", width="stretch", disabled=not picked_active):
+                    _do_cancel(picked_active, "Selected")
+                if k2.button(f"Cancel this session's jobs ({len(sess_active)})", icon=":material/cancel:", width="stretch", disabled=not sess_active):
+                    _do_cancel(sess_active, "This session's submissions")
+                with k3:
+                    word = st.text_input("Type CANCEL ALL to enable", key="cancel_all_word", label_visibility="collapsed", placeholder="Type CANCEL ALL to enable")
+                    if st.button(f"Cancel ALL active ({len(all_active)})", icon=":material/warning:", width="stretch", type="primary",
+                                 disabled=not (all_active and word.strip() == "CANCEL ALL")):
+                        _do_cancel(all_active, "All active jobs")
             export_buttons("job list (CSV)", exp.df_csv_bytes(jdf), "batch_jobs.csv", "text/csv", "jobs")
             nfail = int((jdf["status"] == "FAILED").sum())
             if nfail:
@@ -466,6 +554,34 @@ def _table_view(f: pd.DataFrame) -> pd.DataFrame:
     v["result_status"] = v["result_status"].map(lambda s: ("✅ " if s == "Optimal" else "⏱ " if s == "Time limit" else "❌ " if s in ("FAILED", "UNREADABLE") else "") + str(s))
     v["mip_gap_achieved"] = v["mip_gap_achieved"] * 100.0
     return v
+
+
+def _clone_into_launch(sidecar: dict) -> None:
+    """on_click callback: write a stored run's settings into the Launch tab's widget state."""
+    try:
+        f = lc.form_from_sidecar(sidecar)
+    except lc.InputProblems as exc:
+        st.session_state["clone_msg"] = ("err", " ".join(exc.problems))
+        return
+    ss = st.session_state
+    if f["mode"] == "prespecified":
+        ss["target_mode_radio"] = "Prespecified points"
+        ss["target_source"] = "Paste text"
+        ss["target_paste"] = lc.points_to_csv_text(f["points"])
+    else:
+        ss["target_mode_radio"] = "Country mode (deprecated)"
+        ss["countries_sel"] = f["countries"]
+        ss["globe_points"] = f["n_points"]
+    ss["scenario_code"] = f["scenario"]
+    ss["_scen_default_prev"] = lc.default_scenario(filename=None, countries=f.get("countries", []))   # keep the cloned code; no re-suggest
+    ss["launch_label"], ss["chk_principal"], ss["chk_test"] = f["label"], f["principal"], f["test"]
+    for k, v in f["grid"].items():
+        ss[f"grid_{k}"] = v
+    for k, v in f["advanced"].items():
+        spec = lc.ADVANCED_FIELDS.get(k)
+        if spec:
+            ss[f"adv_{k}"] = int(v) if spec["kind"] is int else float(v)
+    ss["clone_msg"] = ("ok", f"Loaded into the Launch tab ({sidecar.get('run_name')}): open the Launch runs tab to review and submit.")
 
 
 def _empty_results(message: str, kind: str) -> None:
@@ -553,6 +669,11 @@ def render_results() -> None:
                                                                          "intercept_alt_km", "r_max_km", "r_required", "n_targets")},
                                          "seed_generation": rc.get("seed_generation"), "seed_filter": rc.get("seed_filter"),
                                          "solver": rc.get("solver"), "provenance": side.get("provenance")})
+                            panel_title("Re-run")
+                            st.button("Clone into the Launch form", key="clone_btn", icon=":material/content_copy:", on_click=_clone_into_launch, args=(side,),
+                                      help="Copies this run's targets, settings and labels into the Launch tab so you can change them and submit a new run.")
+                            if st.session_state.get("clone_msg"):
+                                (st.success if st.session_state["clone_msg"][0] == "ok" else st.error)(st.session_state["clone_msg"][1])
                             panel_title("Files and checks")
                             s3, _ = _clients()
                             b1, b2 = st.columns(2)
