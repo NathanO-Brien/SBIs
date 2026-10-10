@@ -1,23 +1,26 @@
 """
-cloud_sweep.py
+cloud_sweep.py -- run a parameter grid of optimizations on AWS Batch (or locally with --local).
 
-Cloud parameter sweep launcher for the SBI SCLP constellation optimizer.
+Expands the grid below (salvo size x interceptors/sat x burnout velocity x detection/decision time x target
+burnout time x max acceleration) for ONE prespecified target set into individual run configurations
+(keys and defaults: sbi_coverage.runs.config). Each combination becomes one AWS Batch job (batch_worker.py in
+the Docker image); with --local the same combinations run one after another in this process through the
+same pipeline (sbi_coverage.Lee.run_pipeline.run_sclp), which is how to test a sweep before spending cloud time.
 
-Expands a parameter grid into individual job configurations, uploads each
-config JSON to S3, and submits a separate AWS Batch job for every combination.
-All jobs run in parallel on the cloud (subject to the vCPU limit on the
-compute environment).  This script does no computation locally — it should
-finish in well under a minute regardless of sweep size.
+Results are flat files named by sbi_coverage.runs.names, in S3 runs/ (cloud) or --results-dir (local).
+By default EVERY combination is submitted, layering new runs on top of whatever already exists (same-day
+reruns get the next sequence letter). Pass --skip-existing (or set SKIP_EXISTING = True) to skip combinations
+whose run identity -- readable settings plus the result-affecting hash, any date -- already has a finished
+result in S3 (or in --results-dir with --local).
 
-Edit the SWEEP_* constants below to define the parameter grid, then run:
+Examples:
+    python scripts/cloud_sweep.py --target-points-csv "<...>/CN/Prespecified_100_ICBMS_CN_High_Priority.csv" \\
+        --scenario CN --principal-set --dry-run
+    python scripts/cloud_sweep.py --target-points-csv targets.csv --scenario NK --grid grid.json --skip-existing
+    python scripts/cloud_sweep.py --target-points-csv targets.csv --local --max-jobs 2 --time-limit 60 --test-run
 
-    python scripts/cloud_sweep.py
-
-Results land flat in S3 runs/ with a short decodable name per combination
-(see sbi_coverage.runs.names).
-
-To dry-run without submitting jobs (prints what would be submitted):
-    python scripts/cloud_sweep.py --dry-run
+--grid FILE is a JSON object overriding any of the SWEEP_* lists below, e.g.
+    {"salvo_sizes": [5, 10], "detection_times_s": [0, 15], "burnout_velocities_km_s": [6.0]}
 """
 from __future__ import annotations
 
@@ -25,423 +28,164 @@ import argparse
 import datetime
 import itertools
 import json
-import re
 import sys
 from pathlib import Path
 
-import boto3
-
 from sbi_coverage.core.target_points import load_target_points_csv
-from sbi_coverage.runs.names import (decode_run_name, scenario_from_path, settings_from_config,
-                                    settings_key)
+from sbi_coverage.runs.cloud import S3_CONFIG_PREFIX, clients, s3_run_exists, sanitize_job_name, submit_job, upload_config
+from sbi_coverage.runs.config import CONFIG_DEFAULTS, S3_BUCKET, normalize_config, settings_from_config
+from sbi_coverage.runs.names import decode_run_name, parse_filename, scenario_from_path, settings_key
 
 # ---------------------------------------------------------------------------
-# AWS / S3 configuration — edit to match your deployment
+# Sweep grid (override per launch with --grid FILE)
 # ---------------------------------------------------------------------------
-S3_BUCKET:          str = "sbi-optimization-runs"
-S3_CONFIG_PREFIX:   str = "configs/sweeps"          # where per-job JSON configs are uploaded
-JOB_QUEUE:          str = "sbi-queue"
-JOB_DEFINITION:     str = "sbi-optimizer-job"
-AWS_REGION:         str = "us-east-1"
+SWEEP_SALVO_SIZES:             list[int]   = [100]
+SWEEP_INTERCEPTORS_PER_SAT:    list[int]   = [1, 2, 3, 4, 5, 6]
+SWEEP_BURNOUT_VELOCITIES_KM_S: list[float] = [4.0, 6.0]
+SWEEP_DETECTION_TIMES_S:       list[float] = [0.0, 15.0, 30.0, 45.0]
+SWEEP_DECISION_TIMES_S:        list[float] = [0.0]
+SWEEP_BURNOUT_TIMES_S:         list[float] = [170.0]
+SWEEP_MAX_ACCELS_G:            list[float] = [10.0]
 
-# ---------------------------------------------------------------------------
-# Fixed parameters — must match sweep_optimize.py / batch_worker.py exactly.
-# ---------------------------------------------------------------------------
-TARGET_SHELL_N_POINTS:      int   = 15000
-MIP_GAP:                    float = 0
-TIME_LIMIT_S:               float = 14400.0
-# Seed families (Lee exact J2): altitude/inclination are derived by batch_worker.py
-# from the target latitudes (anchor = highest-latitude family; upper altitude
-# bound = intercept alt + R_max), so there is no altitude or inclination input.
-ND_REPEAT:                  int   = 3
-ALTITUDE_MIN_KM:            float = 200.0
-ANCHOR_LAT_MARGIN_DEG:      float = 0.0
-RAAN_STEP_DEG:              float = 0.25
-DT_S:                       float = 120.0
-INTERCEPT_ALT_KM:           float = 200.0
-MIN_ELEV_DEG:               float = 0.0
-SEED_WORKERS:               int   = 8
-# mip_focus/heuristics_frac/solver_params are intentionally not exposed here
-# -- batch_worker.py's config schema defaults to vanilla Gurobi tuning
-# (MIPFocus=0, Heuristics=0.05, no solver_params overrides) when these keys
-# are absent from the uploaded config, which is what omitting them here
-# achieves. The schema itself still accepts them if per-run tuning is worth
-# reintroducing.
+# Fixed settings for every combination (everything else: CONFIG_DEFAULTS)
+TIME_LIMIT_S: float = 14400.0            # per run; not part of run identity
+MIP_GAP:      float = CONFIG_DEFAULTS["mip_gap"]
+SKIP_EXISTING: bool = False              # --skip-existing sets this for one launch
 
-# ---------------------------------------------------------------------------
-# Target mode -- "country" (sweeps SWEEP_COUNTRIES below) or "prespecified"
-# (one fixed target-point set, shared by every combo in the sweep; not itself
-# a swept dimension).
-# ---------------------------------------------------------------------------
-TARGET_MODE: str = "prespecified"
-TARGET_POINTS: list[list] = [
-    ["Name", 39.79, 125.66],
-]
-# If set (and TARGET_MODE == "prespecified"), overrides TARGET_POINTS above by
-# loading a CSV -- see sbi_coverage.core.target_points.load_target_points_csv.
-TARGET_POINTS_CSV: str | Path | None = r"C:\Users\natha\OneDrive\Documents\GT 2026 Fall Semester\Research\Principle Sets\CN\Prespecified_100_ICBMS_CN_High_Priority.csv"
-
-# ---------------------------------------------------------------------------
-# Run metadata (optional; saved into the output JSON only -- never used for
-# job/config naming, which is unaffected by these). Each combo's saved
-# run_name gets "_<n>" appended, n being its 1-based position in the grid.
-# ---------------------------------------------------------------------------
-RUN_NAME: str | None = "Prespecified_100_ICBMS_CN_High_Priority_PRINCIPAL"
-IS_PRINCIPAL_SET: bool = True
-# Existence check. False (default): every combination is submitted, layering new runs on top of
-# whatever is already in runs/ (same-day reruns get the next sequence letter). True: skip a combo
-# whose run identity (see sbi_coverage.runs.names.settings_key, any date) already exists in S3.
-# The --skip-existing command-line flag turns this on for one launch.
-SKIP_EXISTING: bool = False
-# Short scenario code used in run names (e.g. "CN"). None -> inferred from the CSV path
-# (a "CN"/"NK"/... folder) or, in country mode, from the country name.
-SCENARIO: str | None = None
-
-# ---------------------------------------------------------------------------
-# Sweep grid — mirrors sweep_optimize.py defaults.
-# Change these lists to define the combinations you want to run.
-# ---------------------------------------------------------------------------
-SWEEP_COUNTRIES:                list[str]   = []
-SWEEP_SALVO_SIZES:              list[int]   = [100]
-SWEEP_INTERCEPTORS_PER_SAT:     list[int]   = [1, 2, 3, 4, 5, 6]
-SWEEP_BURNOUT_VELOCITIES_KM_S:  list[float] = [4.0, 6.0]
-# New sweepable dimensions -- default to a single element (the timing/accel
-# value CoverageConfig would otherwise default to) so an unmodified sweep's
-# grid size is unaffected.
-SWEEP_DETECTION_TIMES_S:        list[float] = [0.0, 15.0, 30.0, 45.0]
-SWEEP_DECISION_TIMES_S:         list[float] = [0.0]
-SWEEP_BURNOUT_TIMES_S:          list[float] = [170.0]
-SWEEP_A_G_LIST:                 list[float] = [10.0]
-# margin_multiplier/trim_margin_multiplier/max_seeds_safety_cap (the
-# worst-case-first, margin-driven build+trim seed selection -- see
-# lee_test2.py / sbi_coverage.Lee.seed_pipeline) are intentionally not
-# exposed here -- batch_worker.py's config schema already defaults to the
-# same values (5.0/2.0/200) when these keys are absent from the uploaded
-# config, which is what omitting them here achieves. The schema still accepts
-# them if per-sweep overrides are worth reintroducing.
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _sweep_tag(ts: str) -> str:
-    """Short tag used to namespace this sweep's config files in S3."""
-    return f"sweep_{ts}"
+_GRID_KEYS = {
+    "salvo_sizes": "SWEEP_SALVO_SIZES", "interceptors_per_sat": "SWEEP_INTERCEPTORS_PER_SAT",
+    "burnout_velocities_km_s": "SWEEP_BURNOUT_VELOCITIES_KM_S", "detection_times_s": "SWEEP_DETECTION_TIMES_S",
+    "decision_times_s": "SWEEP_DECISION_TIMES_S", "burnout_times_s": "SWEEP_BURNOUT_TIMES_S",
+    "max_accels_g": "SWEEP_MAX_ACCELS_G",
+}
 
 
-def _config_for(
-    *,
-    target_mode: str,
-    country: str | None,
-    target_points: list | None,
-    salvo_size: int,
-    n_interceptors_per_sat: int,
-    v_bo_km_s: float,
-    detection_time_s: float,
-    decision_time_s: float,
-    target_missile_burnout_time_s: float,
-    a_g: float,
-    job_name: str,
-    run_name: str | None,
-    is_principal_set: bool,
-) -> dict:
-    """Build the JSON config dict for one batch_worker.py job."""
-    return {
-        "job_name":                     job_name,
-        "run_name":                     run_name,
-        "is_principal_set":             is_principal_set,
-        "scenario":                     SCENARIO or (scenario_from_path(TARGET_POINTS_CSV) if TARGET_POINTS_CSV and target_mode == "prespecified" else None),
-        "target_mode":                  target_mode,
-        "target_country":               country if target_mode == "country" else None,
-        "target_points":                target_points if target_mode == "prespecified" else None,
-        "target_shell_n_points":        TARGET_SHELL_N_POINTS if target_mode == "country" else None,
-        "v_bo_km_s":                    v_bo_km_s,
-        "salvo_size":                   salvo_size,
-        "n_interceptors_per_sat":       n_interceptors_per_sat,
-        "mip_gap":                      MIP_GAP,
-        "time_limit_s":                 TIME_LIMIT_S,
-        "nd_repeat":                    ND_REPEAT,
-        "altitude_min_km":              ALTITUDE_MIN_KM,
-        "anchor_lat_margin_deg":        ANCHOR_LAT_MARGIN_DEG,
-        "dt_s":                         DT_S,
-        "detection_time_s":             detection_time_s,
-        "decision_time_s":              decision_time_s,
-        "target_missile_burnout_time_s": target_missile_burnout_time_s,
-        "a_g":                          a_g,
-        "intercept_alt_km":             INTERCEPT_ALT_KM,
-        "min_elev_deg":                 MIN_ELEV_DEG,
-        "raan_step_deg":                RAAN_STEP_DEG,
-        "seed_workers":                 SEED_WORKERS,
-    }
+def build_grid(overrides: dict | None = None) -> list[dict]:
+    """All combinations as dicts of run-configuration keys (row-major over the lists above)."""
+    g = {"salvo_sizes": SWEEP_SALVO_SIZES, "interceptors_per_sat": SWEEP_INTERCEPTORS_PER_SAT,
+         "burnout_velocities_km_s": SWEEP_BURNOUT_VELOCITIES_KM_S, "detection_times_s": SWEEP_DETECTION_TIMES_S,
+         "decision_times_s": SWEEP_DECISION_TIMES_S, "burnout_times_s": SWEEP_BURNOUT_TIMES_S,
+         "max_accels_g": SWEEP_MAX_ACCELS_G}
+    for k, v in (overrides or {}).items():
+        if k not in _GRID_KEYS:
+            raise SystemExit(f"unknown grid key {k!r}; valid keys: {sorted(_GRID_KEYS)}")
+        g[k] = list(v)
+    return [
+        dict(salvo_size=s, n_interceptors_per_sat=i, burnout_velocity_km_s=v, detection_time_s=dt,
+             decision_time_s=dc, target_missile_burnout_time_s=b, max_accel_g=a)
+        for s, i, v, dt, dc, b, a in itertools.product(
+            g["salvo_sizes"], g["interceptors_per_sat"], g["burnout_velocities_km_s"], g["detection_times_s"],
+            g["decision_times_s"], g["burnout_times_s"], g["max_accels_g"])
+    ]
 
 
-def _results_exist(s3: "boto3.client", bucket: str, cfg: dict) -> bool:
-    """True if a lee_j2 result with the same run identity (any date) is already in S3.
-
-    Run names are flat under runs/ (see sbi_coverage.runs.names): the identity is the
-    readable settings tokens plus a hash of everything else, so a run made with a
-    different RAAN step, margin, target set, ... is correctly NOT a duplicate. Results
-    from the older J2-off pipeline live under country/ and prespecified/ (archived) and
-    can never match.
-    """
-    key = settings_key(settings_from_config(cfg))
-    head = key.rsplit("-", 1)[0] + "-"          # readable tokens; the date follows
-    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=f"runs/{head[:head.index('-i')]}"):
-        for obj in page.get("Contents", []):
-            fn = obj["Key"].rsplit("/", 1)[-1]
-            if not fn.endswith("_result.json"):
-                continue
-            try:
-                if decode_run_name(fn)["key"] == key:
-                    return True
-            except ValueError:
-                continue
-    return False
+def _local_exists(results_dir: Path, cfg: dict) -> list[str]:
+    key = settings_key(settings_from_config(normalize_config(cfg)))
+    out = []
+    for p in results_dir.glob("*_result.json") if results_dir.exists() else []:
+        parsed = parse_filename(p.name)
+        if parsed and decode_run_name(parsed[0])["key"] == key:
+            out.append(parsed[0])
+    return sorted(out)
 
 
-def _upload_config(s3: "boto3.client", cfg: dict, bucket: str, key: str) -> str:
-    """Serialize cfg to JSON and upload to S3. Returns the full s3:// URI."""
-    body = json.dumps(cfg, indent=2).encode("utf-8")
-    s3.put_object(Body=body, Bucket=bucket, Key=key)
-    return f"s3://{bucket}/{key}"
+def _parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Run a parameter sweep of SBI optimizations (AWS Batch or --local).",
+                                formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    p.add_argument("--target-points-csv", required=True, help="CSV of target points (Location/Lat/Lon)")
+    p.add_argument("--scenario", help="run-name scenario code, e.g. CN (inferred from the CSV path if omitted)")
+    p.add_argument("--label", help="free-text label stored in every run's JSON (the grid index is appended)")
+    p.add_argument("--principal-set", action="store_true", help="mark runs as a principal research set")
+    p.add_argument("--test-run", action="store_true", help="TEST- name prefix on every run")
+    p.add_argument("--grid", help="JSON file overriding the SWEEP_* lists")
+    p.add_argument("--time-limit", type=float, default=TIME_LIMIT_S, help="per-run solver time limit, s")
+    p.add_argument("--skip-existing", action="store_true", help="skip combinations that already have a finished result")
+    p.add_argument("--dry-run", action="store_true", help="list the combinations and their run identities; submit nothing")
+    p.add_argument("--stagger-seconds", type=int, default=0, help="delay between the first N submissions")
+    p.add_argument("--stagger-count", type=int, default=10, help="number of initial submissions to stagger")
+    p.add_argument("--local", action="store_true", help="run the combinations locally, one after another")
+    p.add_argument("--results-dir", default="results", help="--local: output folder (also used for --skip-existing)")
+    p.add_argument("--max-jobs", type=int, default=None, help="stop after this many submitted/run combinations")
+    return p
 
 
-def _submit_job(
-    batch: "boto3.client",
-    *,
-    job_name: str,
-    s3_config_uri: str,
-) -> str:
-    """Submit one AWS Batch job. Returns the job ID."""
-    response = batch.submit_job(
-        jobName=job_name,
-        jobQueue=JOB_QUEUE,
-        jobDefinition=JOB_DEFINITION,
-        containerOverrides={
-            "environment": [
-                {"name": "S3_CONFIG", "value": s3_config_uri},
-                {"name": "S3_BUCKET", "value": S3_BUCKET},
-            ]
-        },
-    )
-    return response["jobId"]
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main(dry_run: bool = False, stagger_seconds: int = 0, stagger_count: int = 10,
-         skip_existing: bool = SKIP_EXISTING) -> None:
+def main() -> None:
+    a = _parser().parse_args()
+    overrides = json.loads(Path(a.grid).read_text()) if a.grid else None
+    grid = build_grid(overrides)
+    points = load_target_points_csv(a.target_points_csv)
+    scenario = a.scenario or scenario_from_path(a.target_points_csv)
+    skip = a.skip_existing or SKIP_EXISTING
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-    sweep_tag = _sweep_tag(ts)
-
-    # Resolve target mode once. Prespecified mode uses ONE fixed target-point
-    # set for the whole sweep (not itself a swept dimension -- there's no
-    # concept elsewhere in this codebase of sweeping over multiple
-    # prespecified sets, and none was requested).
-    if TARGET_MODE == "prespecified":
-        fixed_target_points = load_target_points_csv(TARGET_POINTS_CSV) if TARGET_POINTS_CSV else TARGET_POINTS
-        fixed_target_slug = (
-            str(fixed_target_points[0][0]).strip().lower()
-            .replace(" ", "-").replace(":", "").replace("/", "-")
-        )[:20]
-    else:
-        fixed_target_points = None
-        fixed_target_slug = None
-
-    # Grid as a list of per-combo dicts rather than positional tuples --
-    # "country" only participates as a dimension in country mode, and this
-    # avoids extending an already-wide positional tuple with a conditional slot.
-    dims: dict[str, list] = {}
-    if TARGET_MODE == "country":
-        dims["country"] = SWEEP_COUNTRIES
-    dims.update({
-        "salvo_size":                     SWEEP_SALVO_SIZES,
-        "n_interceptors_per_sat":         SWEEP_INTERCEPTORS_PER_SAT,
-        "v_bo_km_s":                      SWEEP_BURNOUT_VELOCITIES_KM_S,
-        "detection_time_s":               SWEEP_DETECTION_TIMES_S,
-        "decision_time_s":                SWEEP_DECISION_TIMES_S,
-        "target_missile_burnout_time_s":  SWEEP_BURNOUT_TIMES_S,
-        "a_g":                            SWEEP_A_G_LIST,
-    })
-    grid = [dict(zip(dims.keys(), values)) for values in itertools.product(*dims.values())]
-    n_total = len(grid)
-
-    dim_str = " × ".join(f"{len(v)}" for v in dims.values())
+    sweep_tag = f"sweep_{ts}"
 
     print("=" * 70)
-    print("cloud_sweep.py  —  SBI SCLP Cloud Parameter Sweep Launcher")
-    print("=" * 70)
-    print(f"  Sweep tag          : {sweep_tag}")
-    print(f"  Combinations       : {n_total}  ({dim_str})")
-    print(f"  S3 bucket          : {S3_BUCKET}")
-    print(f"  Config prefix      : {S3_CONFIG_PREFIX}/{sweep_tag}/")
-    print(f"  Job queue          : {JOB_QUEUE}")
-    print(f"  Job definition     : {JOB_DEFINITION}")
-    print(f"  Time limit / job   : {TIME_LIMIT_S / 3600:.1f} h")
-    print(f"  MIP gap target     : {MIP_GAP * 100:.1f}%")
-    if dry_run:
-        print("\n  *** DRY RUN — no configs will be uploaded, no jobs submitted ***")
-    if stagger_seconds > 0:
-        print(f"  Stagger            : {stagger_seconds}s delay between first {stagger_count} submissions")
+    print(f"SBI parameter sweep  ({'LOCAL' if a.local else 'AWS Batch'}{', dry run' if a.dry_run else ''})")
+    print(f"  Targets       : {len(points)} points from {a.target_points_csv}   scenario={scenario}")
+    print(f"  Combinations  : {len(grid)}   skip existing: {skip}   time limit/run: {a.time_limit:.0f} s")
     print("=" * 70)
 
-    if not dry_run or skip_existing:
-        s3 = boto3.client("s3", region_name=AWS_REGION)
-    if not dry_run:
-        batch = boto3.client("batch", region_name=AWS_REGION)
-    print(f"  Skip existing      : {skip_existing}")
+    s3 = batch = None
+    if not a.dry_run and not a.local:
+        s3, batch = clients()
+    elif skip and not a.local:
+        s3, _ = clients()
 
-    submitted: list[dict] = []
-    skipped:   list[dict] = []
-    failed:    list[dict] = []
-
+    submitted = skipped = failed = 0
     for idx, combo in enumerate(grid, 1):
-        if TARGET_MODE == "country":
-            country       = combo["country"]
-            target_points = None
-            target_slug   = country.lower().replace(" ", "-")
-            target_label  = country
-        else:
-            country       = None
-            target_points = fixed_target_points
-            target_slug   = fixed_target_slug
-            target_label  = fixed_target_slug
-
-        salvo     = combo["salvo_size"]
-        n_int     = combo["n_interceptors_per_sat"]
-        v_bo      = combo["v_bo_km_s"]
-        detect_s  = combo["detection_time_s"]
-        decide_s  = combo["decision_time_s"]
-        burnout_s = combo["target_missile_burnout_time_s"]
-        a_g_val   = combo["a_g"]
-
-        # Every swept dimension (including the 4 new item-9 ones) must appear
-        # in job_name -- two combos differing only in one of these would
-        # otherwise share an S3 config key, and since Batch jobs run
-        # asynchronously, a later upload can silently clobber an earlier job's
-        # config before its container downloads it.
-        job_name = (
-            f"{sweep_tag}"
-            f"_{target_slug}"
-            f"_s{salvo}"
-            f"_i{n_int}"
-            f"_v{v_bo:.0f}"
-            f"_dt{int(detect_s)}"
-            f"_dc{int(decide_s)}"
-            f"_bt{int(burnout_s)}"
-            f"_ag{a_g_val:.1f}".replace(".", "p")
-        )
-        # AWS Batch job names must match [a-zA-Z0-9_-] and be <=128 chars.
-        # a_g's decimal point is handled above ("10.0" -> "10p0") since "p" is
-        # more legible than a blanket substitution there. Everything else --
-        # in particular target_slug, which comes from a free-text target/point
-        # name (country names are safe, but a prespecified point's name can
-        # contain parentheses, commas, etc. -- confirmed to break job
-        # submission with a real Russian target set) -- is caught by this
-        # final whitelist substitution instead of trying to blacklist every
-        # punctuation character that might show up in a target name.
-        job_name = re.sub(r"[^A-Za-z0-9_-]", "-", job_name)
-        job_name = re.sub(r"-{2,}", "-", job_name)
-        job_name = job_name[:128]
-
-        combo_run_name = f"{RUN_NAME}_{idx}" if RUN_NAME else None
-
-        config_key = f"{S3_CONFIG_PREFIX}/{sweep_tag}/{job_name}.json"
-        cfg        = _config_for(
-            target_mode=TARGET_MODE,
-            country=country,
-            target_points=target_points,
-            salvo_size=salvo,
-            n_interceptors_per_sat=n_int,
-            v_bo_km_s=v_bo,
-            detection_time_s=detect_s,
-            decision_time_s=decide_s,
-            target_missile_burnout_time_s=burnout_s,
-            a_g=a_g_val,
-            job_name=job_name,
-            run_name=combo_run_name,
-            is_principal_set=IS_PRINCIPAL_SET,
-        )
-
-        label = (
-            f"[{idx:3d}/{n_total}]  {target_label:<12}  "
-            f"salvo={salvo:<4}  int/sat={n_int}  v_bo={v_bo:.0f}km/s  "
-            f"detect={detect_s:.0f}s  decide={decide_s:.0f}s  burnout={burnout_s:.0f}s  a_g={a_g_val:.1f}"
-        )
-
-        # Optional: skip combos that already have a result in S3
-        if skip_existing and _results_exist(s3, S3_BUCKET, cfg):
-            print(f"  SKIP {label}  (already in S3)")
-            skipped.append({"job_name": job_name, "reason": "results already in S3"})
+        cfg = normalize_config({
+            **combo, "target_mode": "prespecified", "target_points": points, "scenario": scenario,
+            "label": f"{a.label}_{idx}" if a.label else None, "is_principal_set": a.principal_set,
+            "is_test_run": a.test_run, "time_limit_s": a.time_limit, "mip_gap": MIP_GAP,
+        })
+        key = settings_key(settings_from_config(cfg))
+        label = (f"[{idx:3d}/{len(grid)}] salvo={cfg['salvo_size']:<4} ips={cfg['n_interceptors_per_sat']} "
+                 f"v={cfg['burnout_velocity_km_s']:g} detect={cfg['detection_time_s']:g} decide={cfg['decision_time_s']:g} "
+                 f"burnout={cfg['target_missile_burnout_time_s']:g} g={cfg['max_accel_g']:g}")
+        if a.max_jobs is not None and (submitted >= a.max_jobs):
+            print(f"  STOP (--max-jobs {a.max_jobs} reached)")
+            break
+        if skip and (a.local or s3 is not None):
+            existing = _local_exists(Path(a.results_dir), cfg) if a.local else s3_run_exists(s3, cfg)
+            if existing:
+                print(f"  SKIP {label}  (finished run exists: {existing[0]})")
+                skipped += 1
+                continue
+        if a.dry_run:
+            print(f"  DRY  {label}\n         identity: {key}")
+            submitted += 1
             continue
-
-        if dry_run:
-            print(f"  DRY  {label}")
-            print(f"         config  → s3://{S3_BUCKET}/{config_key}")
-            print(f"         job     → {job_name}")
-            continue
-
         try:
-            s3_uri = _upload_config(s3, cfg, S3_BUCKET, config_key)
-            job_id = _submit_job(batch, job_name=job_name, s3_config_uri=s3_uri)
-            print(f"  OK   {label}")
-            print(f"         job_id  → {job_id}")
-            submitted.append({"job_name": job_name, "job_id": job_id, "s3_config": s3_uri})
-            if stagger_seconds > 0 and len(submitted) < stagger_count:
-                import time
-                print(f"         (staggering {stagger_seconds}s before next submission...)")
-                time.sleep(stagger_seconds)
-        except Exception as exc:
-            print(f"  FAIL {label}")
-            print(f"         error   → {exc}")
-            failed.append({"job_name": job_name, "error": str(exc)})
+            if a.local:
+                from sbi_coverage.Lee.run_pipeline import run_sclp
+                print(f"  RUN  {label}")
+                summary = run_sclp(cfg, out_dir=a.results_dir, log=lambda m: None, solver_verbose=False)
+                print(f"       -> {summary['run_name']}: {summary['n_satellites']} satellites ({summary['status']})")
+            else:
+                cfg["job_name"] = sanitize_job_name(f"{sweep_tag}_{(scenario or 'ps').lower()}_s{cfg['salvo_size']}"
+                                                    f"_i{cfg['n_interceptors_per_sat']}_v{cfg['burnout_velocity_km_s']:g}"
+                                                    f"_det{cfg['detection_time_s']:g}_dec{cfg['decision_time_s']:g}"
+                                                    f"_b{cfg['target_missile_burnout_time_s']:g}_g{cfg['max_accel_g']:g}")
+                uri = upload_config(s3, cfg, f"{S3_CONFIG_PREFIX}/{sweep_tag}/{cfg['job_name']}.json")
+                job_id = submit_job(batch, job_name=cfg["job_name"], s3_config_uri=uri)
+                print(f"  OK   {label}\n         job_id={job_id}  identity={key}")
+                if a.stagger_seconds > 0 and submitted < a.stagger_count:
+                    import time
+                    time.sleep(a.stagger_seconds)
+            submitted += 1
+        except Exception as exc:  # keep sweeping; report at the end
+            print(f"  FAIL {label}\n         {type(exc).__name__}: {exc}")
+            failed += 1
 
     print("\n" + "=" * 70)
-    if dry_run:
-        print(f"Dry run complete — {n_total} job(s) would have been submitted.")
-    else:
-        print(f"Sweep launch complete.")
-        print(f"  Submitted : {len(submitted)}")
-        print(f"  Skipped   : {len(skipped)}  (--skip-existing)")
-        print(f"  Failed    : {len(failed)}")
-        if failed:
-            print("\nFailed submissions:")
-            for f in failed:
-                print(f"  {f['job_name']}  —  {f['error']}")
+    verb = "would run" if a.dry_run else ("ran" if a.local else "submitted")
+    print(f"{verb}: {submitted}   skipped: {skipped}   failed: {failed}")
+    if not a.local and not a.dry_run:
+        print(f"Output: s3://{S3_BUCKET}/runs/   (browse: streamlit run scripts/run_browser.py)")
     print("=" * 70)
-
-    if failed and not dry_run:
+    if failed:
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Launch SBI SCLP cloud parameter sweep.")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print what would be submitted without uploading configs or submitting jobs.",
-    )
-    parser.add_argument(
-        "--stagger-seconds",
-        type=int,
-        default=0,
-        metavar="SECONDS",
-        help="Delay in seconds between the first N submissions (default: 0, no stagger).",
-    )
-    parser.add_argument(
-        "--stagger-count",
-        type=int,
-        default=10,
-        metavar="N",
-        help="Number of initial submissions to stagger (default: 10).",
-    )
-    parser.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="Skip combinations whose run identity already exists in S3 runs/ (default: submit everything).",
-    )
-    args = parser.parse_args()
-    main(dry_run=args.dry_run, stagger_seconds=args.stagger_seconds, stagger_count=args.stagger_count,
-         skip_existing=args.skip_existing or SKIP_EXISTING)
+    main()

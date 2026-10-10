@@ -22,20 +22,20 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from sbi_coverage.core.config import EarthConstants, SimConfig, CoverageConfig
-from sbi_coverage.core.elements import OrbitalElements, SatellitePhysical
+from sbi_coverage.core.elements import OrbitalElements
 from sbi_coverage.core.frames import eci_to_ecef
 from sbi_coverage.core.shell import Shell
 from sbi_coverage.core.simulate import run_simulation
 from sbi_coverage.Lee import (
     a_km_j2_rgt, lee_j2_rates, rgt_closure_residual, plan_seed_families,
-    rgt_common_ground_track_layer, seed_layer,
+    rgt_common_ground_track_layer,
 )
 from sbi_coverage.propagators import nominal_propagator as NP
 
 EARTH = EarthConstants()
 # Principal-scenario engagement: R_max ~ 746 km, so the altitude upper bound is h_s + R_max ~ 946 km.
 COV = CoverageConfig(earth=EARTH, detection_time_s=15.0, decision_time_s=0.0, target_missile_burnout_time_s=170.0,
-                     v_bo_km_s=6.0, a_g=10.0, intercept_alt_km=200.0, min_elev_deg=0.0)
+                     burnout_velocity_km_s=6.0, max_accel_g=10.0, intercept_alt_km=200.0, min_elev_deg=0.0)
 FAILS: list[str] = []
 
 
@@ -62,9 +62,8 @@ def _propagate_positions(elems: OrbitalElements, n_steps: int, dt_s: float, use_
     mdot=False reproduces the OLD propagator (Keplerian n for M even with J2 on)
     by temporarily swapping the Lee Mdot function for plain mean motion.
     """
-    sim = SimConfig(horizon_s=n_steps * dt_s, dt_s=dt_s, use_j2=use_j2, use_drag=False)
-    phys = SatellitePhysical(bc_kg_m2=np.full(len(elems.a_km), 80.0))
-    state = NP.init_state(elems0=elems, r0_eci_km=None, v0_eci_km_s=None, phys=phys, sim=sim, earth=EARTH)
+    sim = SimConfig(horizon_s=n_steps * dt_s, dt_s=dt_s, use_j2=use_j2)
+    state = NP.init_state(elems0=elems, sim=sim, earth=EARTH)
     orig = NP.lee_mean_anomaly_rate_rad_s
     if not mdot:
         NP.lee_mean_anomaly_rate_rad_s = lambda a, e, i, earth: NP.mean_motion_rad_s(a, earth.mu_km3_s2)
@@ -72,7 +71,7 @@ def _propagate_positions(elems: OrbitalElements, n_steps: int, dt_s: float, use_
         out = []
         for k in range(n_steps + 1):
             dt = 0.0 if k == 0 else dt_s
-            r = NP.step_state_to_eci_positions(state=state, phys=phys, dt_s=dt, t_s=k * dt_s, sim=sim, earth=EARTH)
+            r = NP.step_state_to_eci_positions(state=state, dt_s=dt, sim=sim, earth=EARTH)
             out.append(eci_to_ecef(r, k * dt_s, EARTH))
     finally:
         NP.lee_mean_anomaly_rate_rad_s = orig
@@ -112,6 +111,8 @@ def test_families() -> dict:
               all(abs(f["raan_interval_deg"] - 360.0 / (f["N_P"] // gcd(f["N_P"], f["N_D"]))) < 1e-9 for f in plan["families"]))
         L, dt = plan["L"], plan["dt_s"]
         check(f"{name}: L*dt == T_r", abs(L * dt - plan["T_r_s"]) < 1e-6, f"L={L} dt={dt:.4f}")
+        check(f"{name}: L is a multiple of every repeat factor g (slot k+L/g exactly repeats slot k)",
+              all(L % f["repeat_factor"] == 0 for f in plan["families"]), f"L={L}")
     return plans
 
 
@@ -124,7 +125,7 @@ def _elems_from_layer(layer, idx) -> OrbitalElements:
 def _layer_for(plan, fam, raan_deg=0.0):
     return rgt_common_ground_track_layer(
         inc_deg=fam["inc_deg"], N_P=fam["N_P"], N_D=fam["N_D"], L=plan["L"], earth=EARTH,
-        raan0_deg=raan_deg, use_j2=True, a_km_override=fam["a_km"], dt_s=plan["dt_s"],
+        raan0_deg=raan_deg, a_km=fam["a_km"], dt_s=plan["dt_s"],
     )
 
 
@@ -169,18 +170,17 @@ def test_circulant(plans) -> None:
 
             # access-profile roll on a real target set
             cov = CoverageConfig(earth=EARTH, detection_time_s=15.0, decision_time_s=0.0,
-                                 target_missile_burnout_time_s=170.0, v_bo_km_s=6.0, a_g=10.0,
+                                 target_missile_burnout_time_s=170.0, burnout_velocity_km_s=6.0, max_accel_g=10.0,
                                  intercept_alt_km=200.0, min_elev_deg=10.0)
             shell = Shell.from_points(EARTH, lat_deg=lat, lon_deg=lon, shell_alt_km=cov.intercept_alt_km)
-            sim = SimConfig(horizon_s=(L - 1) * dt, dt_s=dt, use_j2=True, use_drag=False,
-                            analysis_matrix_dtype="uint16")
+            sim = SimConfig(horizon_s=(L - 1) * dt, dt_s=dt, use_j2=True, analysis_matrix_dtype="uint16")
             sl = [0, 7, L // 2]
             acc = []
             for s in sl:
                 e1 = OrbitalElements(*(getattr(layer.elems, f)[[s]] for f in
                                        ("a_km", "e", "i_rad", "raan_rad", "argp_rad", "M0_rad")))
-                ao = run_simulation(e1, SatellitePhysical(bc_kg_m2=np.array([80.0])), sim, cov, EARTH, shell,
-                                    [{"type": "x"}])
+                ao = run_simulation(e1, sim, cov, EARTH, shell, [{"type": "x"}], build_meta=False)
+                check(f"{tag}: simulation returns exactly L={L} time steps", ao.counts.shape[0] == L)
                 acc.append((ao.counts > 0))
             v0 = acc[0]
             ok = all(np.array_equal(acc[j], np.roll(v0, sl[j], axis=0)) for j in (1, 2))
@@ -201,7 +201,7 @@ def test_distinct_slots(plans) -> None:
         # exact-duplicate case: choose L divisible by g
         L = g * int(round(plan["T_r_s"] / (120.0 * g))); dt = plan["T_r_s"] / L
         layer = rgt_common_ground_track_layer(inc_deg=fam["inc_deg"], N_P=fam["N_P"], N_D=fam["N_D"], L=L, earth=EARTH,
-                                              raan0_deg=9.0, use_j2=True, a_km_override=fam["a_km"], dt_s=dt)
+                                              raan0_deg=9.0, a_km=fam["a_km"], dt_s=dt)
         m = L // g
         idx = np.array([0, 5, m, m + 5, 2 * m])
         pos = _propagate_positions(_elems_from_layer(layer, idx), L, dt, use_j2=True, mdot=True)
@@ -217,10 +217,11 @@ def test_distinct_slots(plans) -> None:
 
 
 def print_family_tables(plans) -> None:
-    print("\n5. Families by principal target set (N_D=3, 200-700 km, anchor = lat_max - 2 deg)")
+    print("\n5. Families by principal target set (N_D=3, altitude 200 km to intercept alt + R_max, anchor = lat_max)")
     for name, plan in plans.items():
-        print(f"\n  {name}: lat {plan['lat_min_deg']:.1f}-{plan['lat_max_deg']:.1f}  i_top={plan['i_top_deg']:.2f}  "
-              f"useful floor={plan['inc_floor_deg']:.1f}  T_r={plan['T_r_s']:.3f} s  L={plan['L']}  dt={plan['dt_s']:.4f}")
+        g = plan["generation"]
+        print(f"\n  {name}: lat {g['target_abs_lat_min_deg']:.1f}-{g['target_abs_lat_max_deg']:.1f}  "
+              f"i_top={plan['anchor']['inc_deg']:.2f}  T_r={plan['T_r_s']:.3f} s  L={plan['L']}  dt={plan['dt_s']:.4f}")
         for f in plan["families"]:
             print(f"    {'anchor' if f['is_anchor'] else '      '} N_P={f['N_P']:3d}:{f['N_D']}  i={f['inc_deg']:7.3f}  "
                   f"alt={f['alt_km']:7.2f} km  RAAN interval={f['raan_interval_deg']:.3f} deg")
