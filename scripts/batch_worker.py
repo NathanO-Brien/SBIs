@@ -485,7 +485,7 @@ def main() -> None:
 
     v0_list = simulate_seed_pool(
         sub_layers, sim=sim, cov=cov, earth=earth, shell=shell,
-        propagator=_PROPAGATOR, workers=cfg["seed_workers"], log=_log,
+        propagator=_PROPAGATOR, workers=cfg["seed_workers"], expected_steps=L, log=_log,
     )
     try:
         pool = filter_seed_pool(

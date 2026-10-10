@@ -36,6 +36,8 @@ real coverage geometry when a CoverageConfig is supplied; otherwise the fixed
 """
 from __future__ import annotations
 
+import math
+
 from math import gcd
 from typing import Sequence
 
@@ -277,7 +279,10 @@ def plan_seed_families(
     for f in fams[1:]:
         f["is_anchor"] = False
     T_r = anchor["T_r_s"]
-    L = int(round(T_r / dt_target_s))
+    # L must be a multiple of every kept family's repeat factor g (e.g. g=3 for 45:3): a reducible
+    # rung repeats its ground track every T_r/g, which is an integer number of steps only then.
+    g_all = math.lcm(*[int(f["repeat_factor"]) for f in fams])
+    L = max(g_all, int(round(T_r / dt_target_s / g_all)) * g_all)
     generation = dict(
         # target-set latitude statistics
         target_lat_min_deg=float(signed.min()), target_lat_max_deg=float(signed.max()),

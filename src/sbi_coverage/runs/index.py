@@ -36,15 +36,22 @@ def _row(json_path: Path) -> dict[str, Any] | None:
     row["path"] = str(json_path)
     try:
         data = json.loads(json_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        row["status_note"] = "unreadable json"
+        return _fill_from_sidecar(row, data, json_path)
+    except Exception as exc:  # one bad/legacy file must never break the whole index
+        row["status_note"] = f"unreadable sidecar: {type(exc).__name__}"
         return row
+
+
+def _fill_from_sidecar(row: dict[str, Any], data: dict[str, Any], json_path: Path) -> dict[str, Any]:
     rc = data.get("run_config", {}) or {}
     for k in _RC_FIELDS:
         row[k] = rc.get(k)
     row["n_satellites"] = rc.get("n_satellites_selected", data.get("n_satellites"))
     fams = rc.get("families") or []
-    row["families"] = ", ".join(f"{f['N_P']}:{f['N_D']}@{f['alt_km']:.0f}km x{f.get('satellites_selected', 0)}" for f in fams)
+    row["families"] = ", ".join(
+        f"{f.get('N_P', '?')}:{f.get('N_D', '?')}@{float(f.get('alt_km', float('nan'))):.0f}km x{f.get('satellites_selected', 0)}"
+        for f in fams if isinstance(f, dict)
+    )
     sg = rc.get("seed_generation") or {}
     row["target_lat_span_deg"] = sg.get("target_lat_span_deg")
     row["n_alt_inc_combos"] = sg.get("n_unique_alt_inc_combos_all_candidates")

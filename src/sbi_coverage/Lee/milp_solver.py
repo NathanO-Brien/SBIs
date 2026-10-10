@@ -211,7 +211,7 @@ def solve_sclp(
     *,
     param_c: np.ndarray | None = None,
     n_targets: int = 1,
-    apply_rgt_symmetry_break: bool = True,
+    apply_rgt_symmetry_break: bool = False,
     mip_gap: float = 0.0,
     time_limit_s: float = float("inf"),
     log_file: str | Path | None = None,

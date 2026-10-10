@@ -332,7 +332,7 @@ def main() -> None:
 
     v0_list = simulate_seed_pool(
         sub_layers, sim=sim, cov=cov, earth=earth, shell=shell,
-        propagator=propagator, workers=SEED_SCREENING_WORKERS,
+        propagator=propagator, workers=SEED_SCREENING_WORKERS, expected_steps=L,
     )
     pool = filter_seed_pool(
         v0_list, sub_layers, seed_meta, plan, r_required,

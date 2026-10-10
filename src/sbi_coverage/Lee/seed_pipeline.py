@@ -166,8 +166,13 @@ def build_seed_pool(plan: dict, raan_step_deg: float, earth: EarthConstants):
 
 
 def simulate_seed_pool(sub_layers, *, sim, cov, earth, shell, propagator: str, workers: int,
+                       expected_steps: int | None = None,
                        log: Callable[[str], None] = print) -> list[np.ndarray]:
-    """Slot-0 access profile (L x n_targets, binary) for every seed, simulated in parallel."""
+    """Slot-0 access profile (L x n_targets, uint8 0/1) for every seed, simulated in parallel.
+
+    ``expected_steps`` (the plan's L): if given, every profile must have exactly that many
+    time rows -- a mismatch would silently give the circulant matrix the wrong period.
+    """
     n_seeds = len(sub_layers)
 
     def _one(idx: int):
@@ -176,7 +181,10 @@ def simulate_seed_pool(sub_layers, *, sim, cov, earth, shell, propagator: str, w
             elems0=s_layer.elems, phys=s_layer.phys, sim=sim, cov=cov, earth=earth,
             shell=shell, layer_specs=s_layer.spec, propagator=propagator,
         )
-        return idx, (analysis.counts > 0).astype(np.float64)
+        profile = (analysis.counts > 0).astype(np.uint8)
+        if expected_steps is not None and profile.shape[0] != expected_steps:
+            raise RuntimeError(f"seed {idx}: simulated {profile.shape[0]} time steps, expected L={expected_steps}")
+        return idx, profile
 
     log(f"\nSimulating {n_seeds} seeds  (workers={workers}) ...")
     t0 = time.perf_counter()

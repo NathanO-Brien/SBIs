@@ -358,8 +358,10 @@ def run_simulation(
     pts_ecef_km, n_hat_ecef, lat_deg, lon_deg = _validate_and_extract_shell_arrays(shell)
 
     Np = int(pts_ecef_km.shape[0])
-    times_s = np.arange(0.0, sim.horizon_s + sim.dt_s, sim.dt_s, dtype=np.float64)
-    Nt = int(times_s.size)
+    # Inclusive grid 0, dt, ..., floor(horizon/dt)*dt. Built from an integer count (not
+    # np.arange with a float stop) so horizon=(L-1)*dt always yields exactly L samples.
+    Nt = int(np.floor(sim.horizon_s / sim.dt_s + 1e-9)) + 1
+    times_s = np.arange(Nt, dtype=np.float64) * sim.dt_s
     counts_acc = np.zeros((Nt, Np), dtype=np.uint16)
     if ns > np.iinfo(np.uint16).max:
         print(
