@@ -1,6 +1,4 @@
-"""Region-of-interest masking: latitude bands, lat/lon boxes, and country
-boundary polygons (Natural Earth via GeoPandas).
-"""
+"""Region-of-interest masking: lat/lon boxes and country boundary polygons (Natural Earth via GeoPandas)."""
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -23,13 +21,6 @@ except Exception:
 def _normalize_lon_deg(lon_deg: np.ndarray) -> np.ndarray:
     """Normalize longitude to [-180, 180]."""
     return (lon_deg + 180.0) % 360.0 - 180.0
-
-
-def mask_lat_band(lat_deg: np.ndarray, lat_min_deg: float, lat_max_deg: float) -> np.ndarray:
-    """Inclusive latitude band mask."""
-    lo = float(min(lat_min_deg, lat_max_deg))
-    hi = float(max(lat_min_deg, lat_max_deg))
-    return (lat_deg >= lo) & (lat_deg <= hi)
 
 
 def mask_latlon_box(
@@ -71,18 +62,25 @@ def mask_latlon_box(
 # Country masking via GeoPandas
 # ----------------------------
 
+_NATURALEARTH_GDF = None   # downloaded once per process (it is a network fetch)
+
+
 def _load_naturalearth_lowres():
     """
     Load Natural Earth low-res country boundaries in a GeoPandas>=1.0 compatible way.
-    Source: NACIS-hosted Natural Earth ZIP (110m admin_0 countries).
+    Source: NACIS-hosted Natural Earth ZIP (110m admin_0 countries). Cached for the life of the process.
     """
+    global _NATURALEARTH_GDF
+    if _NATURALEARTH_GDF is not None:
+        return _NATURALEARTH_GDF
     if not _GEO_OK:
         raise ImportError(
             "Country ROI requires geopandas + shapely. Install with: pip install geopandas shapely pyogrio"
         )
 
     url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
-    return gpd.read_file(url)
+    _NATURALEARTH_GDF = gpd.read_file(url)
+    return _NATURALEARTH_GDF
 
 
 _COUNTRY_CACHE = {}

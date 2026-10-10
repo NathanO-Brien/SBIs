@@ -1,6 +1,4 @@
-"""Prespecified target-point helpers: loading a named lat/lon list from a CSV
-file, and computing a geometry-aware inclination sweep floor from that list.
-"""
+"""Prespecified target-point helper: load a named lat/lon list from a CSV file."""
 from __future__ import annotations
 
 import csv

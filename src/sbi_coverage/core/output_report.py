@@ -254,17 +254,12 @@ def _print_multi_country_shell_summary(ao: Analysis) -> None:
     if not isinstance(countries, list) or len(countries) <= 1:
         return
 
-    analysis_shell_mode = shell_inputs.get("analysis_shell_mode", shell_meta.get("analysis_shell_mode"))
-    if not isinstance(analysis_shell_mode, str) or not analysis_shell_mode:
-        analysis_shell_mode = "full"
-
     _print_section("PER-COUNTRY SHELL MASK SUMMARY")
     for country in countries:
         country_mask, summary = build_roi_mask_from_inputs(
             np.asarray(ao.lat_deg, dtype=np.float64),
             np.asarray(ao.lon_deg, dtype=np.float64),
             countries=[str(country)],
-            analysis_shell_mode=analysis_shell_mode,
         )
         country_mask = np.asarray(country_mask, dtype=bool)
         if country_mask.ndim != 1 or country_mask.shape[0] != ao.counts.shape[1]:

@@ -81,8 +81,8 @@ class CoverageConfig:
         max_range = float(
             interceptor_range_km(
                 T_s=float(engagement_time),
-                v_km_s=float(self.burnout_velocity_km_s),
-                a_g=float(self.max_accel_g),
+                burnout_velocity_km_s=float(self.burnout_velocity_km_s),
+                max_accel_g=float(self.max_accel_g),
                 g0_m_s2=float(self.earth.g0_m_s2),
             )
         )

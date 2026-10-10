@@ -1,3 +1,4 @@
+"""Target "shell": the set of points (on a sphere at the intercept altitude) that must be covered."""
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -7,40 +8,30 @@ from typing import Any, Optional
 import numpy as np
 
 from .config import EarthConstants
-from .earth_grid import latitude_line_points_ecef_with_normals_latlon_km, points_ecef_with_normals_latlon_km
+from .earth_grid import points_ecef_with_normals_latlon_km
 from . import regions
 
 
 @dataclass(frozen=True)
 class Shell:
-    """A spherical shell sampling grid in ECEF.
+    """A spherical sampling grid in ECEF at ``shell_alt_km`` above the surface.
 
-    Bundles the simulation point set (points + normals + lat/lon + metadata)
-    into a single object rather than passing raw arrays through the API.
-    Three construction modes exist:
-      - "full":       quasi-uniform Fibonacci sampling of the whole sphere
-      - "symmetric":  latitude-only line of points at a fixed longitude
-      - from_points(): caller-supplied list of exact lat/lon targets
+    Bundles the simulation point set (points + outward normals + lat/lon + metadata) into one object.
+    Two ways to build one:
+      - ``Shell(earth, n_points=N, shell_alt_km=h)``: quasi-uniform Fibonacci sampling of the whole sphere
+        (``analysis_shell_mode == "full"``), typically masked afterwards to a country or box;
+      - ``Shell.from_points(earth, lat_deg=..., lon_deg=..., shell_alt_km=h)``: exact caller-supplied
+        target points (``analysis_shell_mode == "predefined"``) -- what the optimizer uses.
 
     Typical usage:
-        shell = Shell(earth, n_points=5000, shell_alt_km=0.0, analysis_shell_mode="full")
-        shell = Shell(
-            earth,
-            shell_alt_km=200.0,
-            analysis_shell_mode="symmetric",
-            analysis_lat_step_deg=0.5,
-            analysis_longitude_deg=0.0,
-        )
-        shell_roi = shell.mask_country("United States")
-        out = run_simulation(..., shell=shell_roi)
+        shell = Shell(earth, n_points=5000, shell_alt_km=200.0).mask_country("United States")
+        out = run_simulation(..., shell=shell)
     """
 
     earth: EarthConstants
-    n_points: int | None = None
+    n_points: int | None = None            # requested point count ("full" mode)
     shell_alt_km: float = 0.0
-    analysis_shell_mode: str = "full"
-    analysis_lat_step_deg: float | None = None
-    analysis_longitude_deg: float | None = None
+    analysis_shell_mode: str = "full"      # "full" | "predefined" (set by from_points)
 
     # Generated fields
     points_ecef_km: np.ndarray = field(init=False, repr=False)
@@ -50,74 +41,36 @@ class Shell:
     meta: dict[str, Any] = field(init=False, repr=False)
 
     def __post_init__(self):
-        mode = str(self.analysis_shell_mode).strip().lower()
-        if mode == "full":
-            if self.n_points is None:
-                raise ValueError("Shell(full): n_points is required")
-            n_points_used = int(self.n_points)
-            pts, n_hat, lat, lon, meta = points_ecef_with_normals_latlon_km(
-                n_points_used,
-                self.earth,
-                shell_alt_km=float(self.shell_alt_km),
-            )
-            m = dict(meta) if isinstance(meta, dict) else {"meta": meta}
-            m.update({
-                "n_requested": n_points_used,
-                "shell_alt_km": float(self.shell_alt_km),
-                "analysis_shell_mode": "full",
-            })
-            object.__setattr__(self, "n_points", n_points_used)
-            object.__setattr__(self, "analysis_shell_mode", "full")
-            object.__setattr__(self, "analysis_lat_step_deg", None)
-            object.__setattr__(self, "analysis_longitude_deg", None)
-        elif mode == "symmetric":
-            lat_step_deg = 0.5 if self.analysis_lat_step_deg is None else float(self.analysis_lat_step_deg)
-            longitude_deg = 0.0 if self.analysis_longitude_deg is None else float(self.analysis_longitude_deg)
-            pts, n_hat, lat, lon, meta = latitude_line_points_ecef_with_normals_latlon_km(
-                self.earth,
-                lat_step_deg=lat_step_deg,
-                longitude_deg=longitude_deg,
-                shell_alt_km=float(self.shell_alt_km),
-            )
-            m = dict(meta) if isinstance(meta, dict) else {"meta": meta}
-            m.update({
-                "n_requested": int(lat.size),
-                "shell_alt_km": float(self.shell_alt_km),
-                "analysis_shell_mode": "symmetric",
-            })
-            object.__setattr__(self, "n_points", int(lat.size))
-            object.__setattr__(self, "analysis_shell_mode", "symmetric")
-            object.__setattr__(self, "analysis_lat_step_deg", lat_step_deg)
-            object.__setattr__(self, "analysis_longitude_deg", longitude_deg)
-        else:
-            raise ValueError("Shell: analysis_shell_mode must be 'full' or 'symmetric'")
+        if str(self.analysis_shell_mode).strip().lower() != "full":
+            raise ValueError("Shell(): only analysis_shell_mode='full' can be constructed directly; "
+                             "use Shell.from_points() for exact target points")
+        if self.n_points is None:
+            raise ValueError("Shell(full): n_points is required")
+        n_points = int(self.n_points)
+        pts, n_hat, lat, lon, meta = points_ecef_with_normals_latlon_km(
+            n_points, self.earth, shell_alt_km=float(self.shell_alt_km))
+        m = dict(meta) if isinstance(meta, dict) else {"meta": meta}
+        m.update({"n_requested": n_points, "shell_alt_km": float(self.shell_alt_km), "analysis_shell_mode": "full"})
+        self._set_arrays(pts, n_hat, lat, lon, m, n_points=n_points, mode="full")
 
-        # Freeze dataclass, but still assign in __post_init__
+    def _set_arrays(self, pts, n_hat, lat, lon, meta, *, n_points: int | None, mode: str) -> None:
+        """Assign the generated fields of this frozen dataclass and validate them."""
+        object.__setattr__(self, "n_points", n_points)
+        object.__setattr__(self, "analysis_shell_mode", mode)
         object.__setattr__(self, "points_ecef_km", np.asarray(pts, dtype=np.float64))
         object.__setattr__(self, "normals_ecef", np.asarray(n_hat, dtype=np.float64))
         object.__setattr__(self, "lat_deg", np.asarray(lat, dtype=np.float64))
         object.__setattr__(self, "lon_deg", np.asarray(lon, dtype=np.float64))
-        object.__setattr__(self, "meta", m)
-
+        object.__setattr__(self, "meta", meta)
         self._validate()
 
     @classmethod
-    def symmetric_latitude_shell(
-        cls,
-        earth: EarthConstants,
-        *,
-        lat_step_deg: float = 0.5,
-        longitude_deg: float = 0.0,
-        shell_alt_km: float = 0.0,
-    ) -> "Shell":
-        """Convenience constructor for a symmetric (latitude-only) shell."""
-        return cls(
-            earth=earth,
-            shell_alt_km=float(shell_alt_km),
-            analysis_shell_mode="symmetric",
-            analysis_lat_step_deg=float(lat_step_deg),
-            analysis_longitude_deg=float(longitude_deg),
-        )
+    def _bypass(cls, earth: EarthConstants, shell_alt_km: float) -> "Shell":
+        """A Shell whose arrays are filled in by the caller via _set_arrays (skips point generation)."""
+        new = object.__new__(cls)
+        object.__setattr__(new, "earth", earth)
+        object.__setattr__(new, "shell_alt_km", float(shell_alt_km))
+        return new
 
     @classmethod
     def from_points(
@@ -131,12 +84,9 @@ class Shell:
     ) -> "Shell":
         """Build a Shell from a predefined set of lat/lon target points.
 
-        Unlike the 'full' and 'symmetric' modes, no point generation occurs —
-        the caller supplies the exact points of interest. Useful for MILP target
-        sets where each point is a named geographic target rather than a grid sample.
-
-        Each point is placed on the spherical shell at earth.r_eq_km + shell_alt_km.
-        Normals are outward radial unit vectors (same convention as 'full' mode).
+        No point generation occurs -- the caller supplies the exact points of interest (named
+        geographic targets for the MILP). Each point is placed at earth.r_eq_km + shell_alt_km with an
+        outward radial unit normal.
         """
         lat = np.asarray(lat_deg, dtype=np.float64).ravel()
         lon = np.asarray(lon_deg, dtype=np.float64).ravel()
@@ -145,53 +95,26 @@ class Shell:
         if lat.size == 0:
             raise ValueError("Shell.from_points(): at least one point is required")
 
-        lat_rad = np.deg2rad(lat)
-        lon_rad = np.deg2rad(lon)
+        lat_rad, lon_rad = np.deg2rad(lat), np.deg2rad(lon)
         cos_lat = np.cos(lat_rad)
-        u = np.stack(
-            [cos_lat * np.cos(lon_rad), cos_lat * np.sin(lon_rad), np.sin(lat_rad)],
-            axis=1,
-        )
+        u = np.stack([cos_lat * np.cos(lon_rad), cos_lat * np.sin(lon_rad), np.sin(lat_rad)], axis=1)
         r_shell_km = float(earth.r_eq_km) + float(shell_alt_km)
-        pts   = r_shell_km * u
-        n_hat = u
 
         m: dict[str, Any] = {
-            "n_requested": int(lat.size),
-            "n_used": int(lat.size),
-            "shell_alt_km": float(shell_alt_km),
-            "r_shell_km": r_shell_km,
-            "analysis_shell_mode": "predefined",
-            "point_generation_method": "from_points",
+            "n_requested": int(lat.size), "n_used": int(lat.size), "shell_alt_km": float(shell_alt_km),
+            "r_shell_km": r_shell_km, "analysis_shell_mode": "predefined", "point_generation_method": "from_points",
         }
         if meta_extra:
             m.update(meta_extra)
-
-        new = object.__new__(cls)
-        object.__setattr__(new, "earth",                  earth)
-        object.__setattr__(new, "n_points",               int(lat.size))
-        object.__setattr__(new, "shell_alt_km",           float(shell_alt_km))
-        object.__setattr__(new, "analysis_shell_mode",    "predefined")
-        object.__setattr__(new, "analysis_lat_step_deg",  None)
-        object.__setattr__(new, "analysis_longitude_deg", None)
-        object.__setattr__(new, "points_ecef_km",         pts)
-        object.__setattr__(new, "normals_ecef",           n_hat)
-        object.__setattr__(new, "lat_deg",                lat)
-        object.__setattr__(new, "lon_deg",                lon)
-        object.__setattr__(new, "meta",                   m)
-        new._validate()
+        new = cls._bypass(earth, shell_alt_km)
+        new._set_arrays(r_shell_km * u, u, lat, lon, m, n_points=int(lat.size), mode="predefined")
         return new
 
-    # Convenience aliases used by driver scripts
+    # Convenience aliases
     @property
     def points_ecef(self) -> np.ndarray:
         """Alias for points_ecef_km."""
         return self.points_ecef_km
-
-    @property
-    def n_hat_ecef(self) -> np.ndarray:
-        """Alias for normals_ecef."""
-        return self.normals_ecef
 
     @property
     def n_points_used(self) -> int:
@@ -214,124 +137,35 @@ class Shell:
         mask = np.asarray(mask, dtype=bool)
         if mask.shape[0] != self.n_points_used:
             raise ValueError("Shell.mask(): mask length must match number of points")
-
-        # Construct a new shell without regenerating by bypassing __post_init__
-        new = object.__new__(Shell)
-        object.__setattr__(new, "earth", self.earth)
-        object.__setattr__(new, "n_points", None if self.n_points is None else int(self.n_points))
-        object.__setattr__(new, "shell_alt_km", float(self.shell_alt_km))
-        object.__setattr__(new, "analysis_shell_mode", str(self.analysis_shell_mode))
-        object.__setattr__(new, "analysis_lat_step_deg", self.analysis_lat_step_deg)
-        object.__setattr__(new, "analysis_longitude_deg", self.analysis_longitude_deg)
-        object.__setattr__(new, "points_ecef_km", self.points_ecef_km[mask].copy())
-        object.__setattr__(new, "normals_ecef", self.normals_ecef[mask].copy())
-        object.__setattr__(new, "lat_deg", self.lat_deg[mask].copy())
-        object.__setattr__(new, "lon_deg", self.lon_deg[mask].copy())
-
         m = dict(self.meta)
         m.update({"n_used": int(np.count_nonzero(mask))})
         if meta_update:
             m.update(dict(meta_update))
-        object.__setattr__(new, "meta", m)
-        new._validate()
+        new = self._bypass(self.earth, self.shell_alt_km)
+        new._set_arrays(self.points_ecef_km[mask].copy(), self.normals_ecef[mask].copy(), self.lat_deg[mask].copy(),
+                        self.lon_deg[mask].copy(), m, n_points=None if self.n_points is None else int(self.n_points),
+                        mode=str(self.analysis_shell_mode))
         return new
 
-    def mask_latlon_box(
-        self,
-        *,
-        lat_min_deg: float,
-        lat_max_deg: float,
-        lon_min_deg: float,
-        lon_max_deg: float,
-    ) -> "Shell":
-        """Return a new Shell restricted to a lat/lon bounding box.
-
-        Symmetric shells have no longitude dimension, so the box collapses to
-        a latitude band in that mode.
-        """
-        if str(self.analysis_shell_mode).strip().lower() == "symmetric":
-            mask = regions.mask_lat_band(
-                self.lat_deg,
-                lat_min_deg=float(lat_min_deg),
-                lat_max_deg=float(lat_max_deg),
-            )
-            return self.mask(mask, meta_update={
-                "roi_mode": "lat_band_from_box",
-                "lat_min_deg": float(min(lat_min_deg, lat_max_deg)),
-                "lat_max_deg": float(max(lat_min_deg, lat_max_deg)),
-                "source_lon_min_deg": float(lon_min_deg),
-                "source_lon_max_deg": float(lon_max_deg),
-            })
-
-        mask = regions.mask_latlon_box(
-            self.lat_deg,
-            self.lon_deg,
-            lat_min_deg=lat_min_deg,
-            lat_max_deg=lat_max_deg,
-            lon_min_deg=lon_min_deg,
-            lon_max_deg=lon_max_deg,
-        )
+    def mask_latlon_box(self, *, lat_min_deg: float, lat_max_deg: float, lon_min_deg: float, lon_max_deg: float) -> "Shell":
+        """Return a new Shell restricted to a lat/lon bounding box."""
+        mask = regions.mask_latlon_box(self.lat_deg, self.lon_deg, lat_min_deg=lat_min_deg, lat_max_deg=lat_max_deg,
+                                       lon_min_deg=lon_min_deg, lon_max_deg=lon_max_deg)
         return self.mask(mask, meta_update={
-            "roi_mode": "latlon_box",
-            "lat_min_deg": float(lat_min_deg),
-            "lat_max_deg": float(lat_max_deg),
-            "lon_min_deg": float(lon_min_deg),
-            "lon_max_deg": float(lon_max_deg),
+            "roi_mode": "latlon_box", "lat_min_deg": float(lat_min_deg), "lat_max_deg": float(lat_max_deg),
+            "lon_min_deg": float(lon_min_deg), "lon_max_deg": float(lon_max_deg),
         })
 
-    def mask_country(
-        self,
-        country: str | Sequence[str],
-        *countries: str,
-        bbox_prefilter: bool = True,
-    ) -> "Shell":
+    def mask_country(self, country: str | Sequence[str], *countries: str, bbox_prefilter: bool = True) -> "Shell":
         """Return a new Shell restricted to points inside one or more countries.
 
-        Accepts a single name, a sequence of names, or multiple positional
-        names. Symmetric shells collapse the country geometry to its latitude
-        band. bbox_prefilter speeds up point-in-polygon testing on full shells.
+        Accepts a single name, a sequence of names, or multiple positional names. ``bbox_prefilter``
+        speeds up point-in-polygon testing.
         """
         if countries:
-            if isinstance(country, str):
-                country_arg: str | Sequence[str] = [country, *countries]
-            else:
-                country_arg = [*country, *countries]
+            country_arg: str | Sequence[str] = [country, *countries] if isinstance(country, str) else [*country, *countries]
         else:
             country_arg = country
-        if str(self.analysis_shell_mode).strip().lower() == "symmetric":
-            if isinstance(country_arg, str):
-                country_list = [country_arg.strip()] if country_arg.strip() else []
-            else:
-                country_list = [str(c).strip() for c in country_arg if str(c).strip()]
-            if not country_list:
-                raise ValueError("Shell.mask_country(): at least one country must be provided")
-            bounds = [regions.country_latlon_bounds(c) for c in country_list]
-            lat_min = min(float(b["lat_min_deg"]) for b in bounds)
-            lat_max = max(float(b["lat_max_deg"]) for b in bounds)
-            mask = regions.mask_lat_band(self.lat_deg, lat_min, lat_max)
-            if len(country_list) == 1:
-                roi_meta = {
-                    "roi_mode": "country_lat_band",
-                    **bounds[0],
-                    "n_total": int(self.lat_deg.shape[0]),
-                    "n_roi": int(mask.sum()),
-                }
-            else:
-                roi_meta = {
-                    "roi_mode": "multi_country_lat_band",
-                    "countries": list(country_list),
-                    "country_count": int(len(country_list)),
-                    "lat_min_deg": lat_min,
-                    "lat_max_deg": lat_max,
-                    "n_total": int(self.lat_deg.shape[0]),
-                    "n_roi": int(mask.sum()),
-                    "country_components": bounds,
-                }
-            return self.mask(mask, meta_update=roi_meta)
-        mask, roi_meta = regions.mask_country(
-            self.lat_deg,
-            self.lon_deg,
-            country=country_arg,
-            bbox_prefilter=bbox_prefilter,
-        )
+        mask, roi_meta = regions.mask_country(self.lat_deg, self.lon_deg, country=country_arg,
+                                              bbox_prefilter=bbox_prefilter)
         return self.mask(mask, meta_update=roi_meta)
